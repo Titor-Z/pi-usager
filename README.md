@@ -2,10 +2,11 @@
 
 # pi-usager
 
-**Usager**（法语"使用者"）—— 这个插件让每一位 Pi Agent 用户成为实时费用可视化的特权持有者。
+**Usager**（法语“使用者”）—— 给每一位在意每一分钱的 Pi 用户。
 
-为 Pi Agent 打造的特权状态栏监控 — 实时掌握 GLM/DeepSeek 用量、费用与余额
-A privileged status bar monitor for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek)
+实时监控 GLM / DeepSeek 的用量、费用与余额，`/usage` 即见分晓。
+
+**A privileged status bar monitor for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek).**
 
 </div>
 
@@ -19,7 +20,22 @@ A privileged status bar monitor for Pi Agent — real-time usage & multi-provide
 ↑130.9k ↓24.5k R1.34M CH91.1% ¥0.0078/¥0.24·限时5折  5.9%/1.00M · low    glm-5.3-flash
 ```
 
-每次对话花了多少钱、这个会话累计花了多少钱、缓存帮你省了多少 —— 一目了然。支持 GLM 与 DeepSeek，价格档位、限时折扣、峰谷计费自动切换。
+每次对话花了多少钱、这个会话累计花了多少钱、缓存帮你省了多少 —— 一目了然。
+
+### 状态栏字段说明
+
+| 字段 | 含义 |
+|---|---|
+| `↑130.9k` / `↓24.5k` | 累计输入 / 输出 Token |
+| `R1.34M` | 累计缓存命中 Token |
+| `CH91.1%` | 缓存命中率 |
+| `¥0.0078/¥0.24` | 此次回答预估价 / 会话累计预估价 |
+| `·限时5折` | 当前计价档位标记（限时折扣等） |
+| `5.9%/1.00M` | 上下文使用率 / 模型窗口 |
+| `·low` | 思考深度 |
+| `💰¥2.12` | 账户余额（按厂商支持情况显示） |
+
+价格档位、限时折扣、峰谷计费自动切换，无需手动干预。
 
 ## 📦 安装
 
@@ -69,6 +85,15 @@ export const mimoAdapter: ProviderAdapter = {
 2. **余额提供者**（可选）在 `balance.ts` 实现 `BalanceProvider`。
 3. **注册**：加入 `index.ts` 与 `balance.ts` 的注册表。
 
+## 🧩 厂商支持
+
+| 厂商 | 费用统计 | 余额查询 | 计价档位 |
+|---|---|---|---|
+| GLM | ✅ | ✅ | 阶梯定价 + 限时折扣 |
+| DeepSeek | ✅ | ✅ | 峰谷定价 |
+
+更多厂商正在适配中（Mimo 等欢迎 PR，见下方指南）。
+
 ## ⚠️ 免责声明
 
 - 本项目为非官方社区项目，与智谱（Z.ai / BigModel）、DeepSeek 无关联
@@ -82,3 +107,7 @@ export const mimoAdapter: ProviderAdapter = {
 ## License
 
 MIT © 2026 Titor-Z
+
+---
+
+**Star 🌟 这个项目，让更多 Pi 用户看见他们的每一分钱花在了哪里。**
