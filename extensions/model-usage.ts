@@ -7,13 +7,14 @@
  *
  * 统一人民币 ¥ 计价; 免费模型显示 FREE; 支持限时折扣/峰谷价自动切换。
  *
- * 命令 (deepseek 为向后兼容别名):
+ * 命令:
  *   /usage            - 显示余额 + 当前会话用量
  *   /usage balance    - 仅查余额
  *   /usage session    - 仅查当前会话用量（含详细计费 + 最近一次回答费用）
  *   /usage footer     - 切换专属状态栏
  *   /usage status     - 切换状态栏余额显示
  *   /usage peak       - 当前生效的计价变体（峰谷/限时折扣）及切换时间
+ *   /usage config     - 交互式配置（凭证/刷新间隔）
  *
  * 安装: 复制到 ~/.pi/agent/extensions/ 后 /reload 即可
  */
@@ -523,11 +524,7 @@ export default function (pi: ExtensionAPI) {
 		handler,
 	});
 
-	// 向后兼容别名
-	pi.registerCommand("deepseek", {
-		description: "（别名）同 /usage，现自动支持 DeepSeek/GLM 等多模型",
-		handler,
-	});
+	// （无向后兼容别名：pi-usager 是独立新包，统一使用 /usage）
 
 	// ── 选中支持余额查询的模型时自动显示余额 ──
 	pi.on("model_select", async (event, ctx) => {

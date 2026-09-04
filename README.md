@@ -42,7 +42,7 @@ pi install git:github.com/Titor-Z/pi-usager
 | `/usage peak` | 当前计价档位及切换时间 |
 | `/usage config` | 交互式配置厂商凭证 |
 
-> `/deepseek` 保留为向后兼容别名。
+> 另有交互式配置：`/usage config`（凭证、刷新间隔）。
 
 ## 🔧 添加新厂商（欢迎 PR！）
 
