@@ -1,7 +1,7 @@
 {
 	"name": "pi-usager",
 	"version": "1.0.0",
-	"description": "A privileged status bar monitor for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek) | 为 Pi Agent 打造的特权状态栏监控，实时掌握 GLM/DeepSeek 用量与余额",
+	"description": "为 Pi Agent 打造的特权状态栏监控 — 实时掌握 GLM/DeepSeek 用量、费用与余额 | A privileged status bar monitor for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek)",
 	"keywords": ["pi-package", "pi-extension", "usage", "hud", "billing", "glm", "deepseek"],
 	"license": "MIT",
 	"author": "Titor-Z",
