@@ -64,7 +64,7 @@ pi install git:github.com/Titor-Z/pi-usager
 
 三步接入（以 Mimo 为例）：
 
-1. **定价适配器** `extensions/usage-providers/mimo.ts`：
+1. **定价适配器** `src/mimo.ts`：
 
 ```typescript
 import type { ProviderAdapter } from "./types.ts";
@@ -83,7 +83,7 @@ export const mimoAdapter: ProviderAdapter = {
 ```
 
 2. **余额提供者**（可选）在 `balance.ts` 实现 `BalanceProvider`。
-3. **注册**：加入 `index.ts` 与 `balance.ts` 的注册表。
+3. **注册**：加入 `src/index.ts` 与 `src/balance.ts` 的注册表。
 
 ## 🧩 厂商支持
 

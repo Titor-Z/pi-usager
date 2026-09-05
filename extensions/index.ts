@@ -3,7 +3,7 @@
  *
  * 在 pi 中查询模型服务商账户余额和 API 用量统计。
  * 支持 DeepSeek、GLM (智谱), 未来可扩展 Mimo 等 —— 定价与计费逻辑
- * 全部抽离到 ./usage-providers/ 公共模块, 按 current model 自动切换。
+ * 全部抽离到 ../src/ 公共模块, 按 current model 自动切换。
  *
  * 统一人民币 ¥ 计价; 免费模型显示 FREE; 支持限时折扣/峰谷价自动切换。
  *
@@ -22,16 +22,16 @@
 
 import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { resolveProvider } from "./usage-providers/index.ts";
-import { isPeakHour } from "./usage-providers/deepseek.ts";
-import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "./usage-providers/cost.ts";
-import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "./usage-providers/balance.ts";
+import { resolveProvider } from "../src/index.ts";
+import { isPeakHour } from "../src/deepseek.ts";
+import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "../src/cost.ts";
+import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
 import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes,
 	type BalanceProviderConfig,
-} from "./usage-providers/config.ts";
-import type { ProviderAdapter, ProviderBalance, BalanceResult } from "./usage-providers/types.ts";
+} from "../src/config.ts";
+import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
 
 // ═══════════════════════════════════════════
 //  余额展示
