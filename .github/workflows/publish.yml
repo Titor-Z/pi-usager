@@ -1,0 +1,25 @@
+# 发布到 npm：推送 v* tag 时自动执行
+# 认证：GitHub Secret NPM_TOKEN（granular token，勾选 bypass 2FA）
+#   更换 token：gh secret set NPM_TOKEN（本地 gh CLI 已登录）
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      - name: Check version matches tag
+        run: node -e "const v=require('./package.json').version; const t=process.env.GITHUB_REF_NAME.slice(1); if(v!==t){console.error(`package.json ${v} != tag v${t}`);process.exit(1)}"
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -40,7 +40,7 @@
 ## 📦 安装
 
 ```bash
-pi install npm:pi-usager
+pi install npm:@foolsecret/pi-usager
 # 或从 GitHub
 pi install git:github.com/Titor-Z/pi-usager
 ```
@@ -102,7 +102,7 @@ export const mimoAdapter: ProviderAdapter = {
 
 ## English
 
-**pi-usager** is a status-bar usage & billing monitor for Pi Agent. It shows per-turn / session cost estimates, token flow, cache hit rate, and account balance for GLM and DeepSeek, with automatic price-tier and discount switching. Install with `pi install npm:pi-usager`, then type `/usage`. New providers are welcome — three small files per provider, see the guide above.
+**pi-usager** is a status-bar usage & billing monitor for Pi Agent. It shows per-turn / session cost estimates, token flow, cache hit rate, and account balance for GLM and DeepSeek, with automatic price-tier and discount switching. Install with `pi install npm:@foolsecret/pi-usager`, then type `/usage`. New providers are welcome — three small files per provider, see the guide above.
 
 ## License
 
