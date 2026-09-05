@@ -16,7 +16,8 @@
  *   /usage peak       - 当前生效的计价变体（峰谷/限时折扣）及切换时间
  *   /usage config     - 交互式配置（凭证/刷新间隔）
  *
- * 安装: 复制到 ~/.pi/agent/extensions/ 后 /reload 即可
+ * 安装: 在 ~/.pi/agent/settings.json 的 packages 中添加 pi-usager 项目路径
+ * 配置: ~/.pi/pi-usager.json (凭证/刷新间隔, 由 /usage config 写入)
  */
 
 import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil-works/pi-coding-agent";
@@ -95,7 +96,7 @@ function autoRecommendReason(
 
 async function configFlow(ctx: ExtensionContext): Promise<void> {
 	if (!ctx.hasUI) {
-		ctx.ui.notify("当前环境无 TUI，无法交互式配置；请手动编辑 usage-providers/balance-config.json", "warning");
+		ctx.ui.notify("当前环境无 TUI，无法交互式配置；请手动编辑 ~/.pi/pi-usager.json", "warning");
 		return;
 	}
 	const action = await ctx.ui.select(
@@ -137,7 +138,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		}
 		const ok = await ctx.ui.confirm(
 			"保存凭证?",
-			`将明文保存到 ${"usage-providers/balance-config.json"}（本地文件，勿提交 git）`,
+			`将明文保存到 ~/.pi/pi-usager.json（本地文件，勿分享/提交 git）`,
 		);
 		if (!ok) return;
 		saveProviderConfig(providerId, creds);

@@ -56,7 +56,7 @@ export const deepseekAdapter: ProviderAdapter = {
 	billingNote: "按量实时计费，¥ 结算；高峰时段（9:00~12:00, 14:00~18:00 北京时间）价格为平时的 2 倍",
 	cacheNote: "隐式上下文缓存，命中部分按缓存命中价计费；pi 的 usage.cacheRead 对应其缓存命中 token 数",
 
-	// 余额查询委托给 balance.ts (凭证: balance-config.json → 环境变量 → auth.json)
+	// 余额查询委托给 balance.ts (凭证: ~/.pi/pi-usager.json → 环境变量 → auth.json)
 	queryBalance: () => queryBalanceFor("deepseek"),
 };
 

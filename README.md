@@ -58,7 +58,7 @@ pi install git:github.com/Titor-Z/pi-usager
 | `/usage peak` | 当前计价档位及切换时间 |
 | `/usage config` | 交互式配置厂商凭证 |
 
-> 另有交互式配置：`/usage config`（凭证、刷新间隔）。
+> 另有交互式配置：`/usage config`（凭证、刷新间隔）。配置存储于 `~/.pi/pi-usager.json`（含凭证，勿分享）。
 
 ## 🔧 添加新厂商（欢迎 PR！）
 

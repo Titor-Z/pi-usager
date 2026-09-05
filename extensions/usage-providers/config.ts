@@ -1,13 +1,13 @@
 /**
  * 余额查询配置持久化
  *
- * 文件: ~/.pi/agent/extensions/usage-providers/balance-config.json
+ * 文件: ~/.pi/pi-usager.json
  * 注意: 该文件含厂商凭证 (API Key 等), 属敏感信息, 不要提交到 git。
  */
 
-import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface BalanceProviderConfig {
 	/** 字段名 → 值 (凭证等) */
@@ -21,7 +21,7 @@ export interface BalanceConfig {
 	refreshMinutes?: number;
 }
 
-export const CONFIG_PATH = join(homedir(), ".pi/agent/extensions/usage-providers/balance-config.json");
+export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
 
 export function loadConfig(): BalanceConfig {
 	try {
@@ -33,6 +33,7 @@ export function loadConfig(): BalanceConfig {
 }
 
 export function saveConfig(config: BalanceConfig): void {
+	mkdirSync(dirname(CONFIG_PATH), { recursive: true });
 	const tmp = CONFIG_PATH + ".tmp";
 	writeFileSync(tmp, JSON.stringify(config, null, "\t"));
 	renameSync(tmp, CONFIG_PATH); // 原子替换

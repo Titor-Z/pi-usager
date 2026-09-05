@@ -2,7 +2,7 @@
  * 余额查询模块
  *
  * 每个厂商实现一个 BalanceProvider, 声明自己需要的凭证字段,
- * 凭证来源优先级: balance-config.json (交互式配置) → 环境变量 → auth.json 兜底。
+ * 凭证来源优先级: ~/.pi/pi-usager.json (交互式配置) → 环境变量 → auth.json 兜底。
  *
  * 新增厂商: 实现 BalanceProvider 并加入 BALANCE_PROVIDERS 即可,
  * /usage config 的交互式配置流会自动读取 fields 生成录入表单。
@@ -56,7 +56,7 @@ function readAuthJson(): any {
 	return undefined;
 }
 
-/** 凭证优先级: balance-config.json → 环境变量 → auth.json */
+/** 凭证优先级: ~/.pi/pi-usager.json → 环境变量 → auth.json */
 export function getCredentials(providerId: string, envKeys: string[], authJsonKeys: string[]): BalanceProviderConfig {
 	const fromConfig = loadConfig().providers?.[providerId];
 	if (fromConfig && Object.keys(fromConfig).length > 0) return fromConfig;
