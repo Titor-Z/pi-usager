@@ -32,6 +32,8 @@ export interface BalanceConfig {
 	refreshMinutes?: number;
 	/** 本地余额台账 (校准层持久化): 启动时立即渲染, 再异步校准纠偏 */
 	balanceCache?: Record<string, CachedBalance>;
+	/** HUD footer 布局: dual = 双行 (原生风格, 余额在首行右侧); single = 单行紧凑; 默认 dual */
+	footerLayout?: "dual" | "single";
 }
 
 export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
@@ -79,5 +81,15 @@ export function getRefreshMinutes(): number {
 export function setRefreshMinutes(minutes: number): void {
 	const config = loadConfig();
 	config.refreshMinutes = minutes;
+	saveConfig(config);
+}
+
+export function getFooterLayout(): "dual" | "single" {
+	return loadConfig().footerLayout ?? "dual";
+}
+
+export function setFooterLayout(layout: "dual" | "single"): void {
+	const config = loadConfig();
+	config.footerLayout = layout;
 	saveConfig(config);
 }

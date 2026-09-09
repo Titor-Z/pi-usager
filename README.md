@@ -78,7 +78,7 @@ pi install git:github.com/Titor-Z/pi-usager
 | `/usage` | 余额 + 会话用量总览 |
 | `/usage session` | 用量与费用明细 |
 | `/usage balance` | 账户余额 |
-| `/usage footer` | 开关状态栏（默认开启） |
+| `/usage hud` | HUD 显示设置抽屉（开关/布局双行⭐/单行）；`on\|off` 直接开关 |
 | `/usage peak` | 当前计价档位及切换时间 |
 | `/usage config` | 交互式配置厂商凭证 |
 

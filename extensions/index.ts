@@ -13,7 +13,7 @@
  *   /usage            - 显示余额 + 当前会话用量
  *   /usage balance    - 仅查余额
  *   /usage session    - 仅查当前会话用量（含详细计费 + 最近一次回答费用）
- *   /usage footer     - 切换专属状态栏
+ *   /usage hud        - HUD 显示设置抽屉 (开关/布局); /usage hud on|off 直接开关
  *   /usage status     - 切换状态栏余额显示
  *   /usage peak       - 当前生效的计价变体（峰谷/限时折扣）及切换时间
  *   /usage config     - 交互式配置（凭证/刷新间隔）
@@ -34,7 +34,7 @@ import {
 } from "../src/ledger.ts";
 import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
-	getRefreshMinutes, setRefreshMinutes,
+	getRefreshMinutes, setRefreshMinutes, getFooterLayout, setFooterLayout,
 	type BalanceProviderConfig,
 } from "../src/config.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
@@ -195,6 +195,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		const config = loadConfig();
 		const lines: string[] = ["━━━ 使用量配置 ━━━"];
 		lines.push(`  余额校准间隔: ${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`);
+		lines.push(`  HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`);
 		const providers = config.providers ?? {};
 		if (Object.keys(providers).length === 0) {
 			lines.push("  (未配置任何厂商凭证, 将回退环境变量/auth.json)");
@@ -324,9 +325,11 @@ async function calibrateProvider(providerId: string, opts?: { flash?: boolean })
 		// 否则每次启动校准都会闪一下无意义的伪动画
 		const MIN_FLASH_DELTA = 0.01;
 		if (opts?.flash && !isDepleted(providerId) && beforeTotal !== undefined) {
-			const after = parseFloat(result.total);
+		const after = parseFloat(result.total);
 			if (after > beforeTotal + MIN_FLASH_DELTA) {
-				startFlip(providerId, after - beforeTotal, "gain", { from: beforeTotal, to: after });
+				// gain 起点钳零: 欠费期间 turn_end 仍累计 sessionSpent, before 可能为微小负数,
+				// 动画起点帧会显示 ¥-0.00, 观感差且无意义
+				startFlip(providerId, after - beforeTotal, "gain", { from: Math.max(0, beforeTotal), to: after });
 			} else if (after < beforeTotal - MIN_FLASH_DELTA) {
 				// 校准发现下跌 (免费模型/多会话的真实扣减只在校准时可见): 同样翻页, 不再静默跳变
 				startFlip(providerId, beforeTotal - after, "spend", { from: beforeTotal, to: after });
@@ -559,6 +562,24 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const pad2 = " ".repeat(Math.max(2, width - visibleWidth(left2Shown) - right2W));
 				const line2 = left2Shown + pad2 + theme.fg("dim", right2);
 
+				// 单行紧凑布局: 统计 (左) …… 模型名 + 余额 + 峰谷 (右)
+				// 降级链: 丢峰谷图标 → 丢模型名 → 余额段最后才截; 左侧统计先截
+				if (getFooterLayout() === "single") {
+					const modelSeg3 = theme.fg("dim", modelName);
+					let parts3 = [modelSeg3, balSeg, peakSeg].filter((p): p is string => p !== undefined);
+					if (peakSeg && visibleWidth(parts3.join(" ")) > width) {
+						parts3 = parts3.filter((p) => p !== peakSeg);
+					}
+					if (modelSeg3 && visibleWidth(parts3.join(" ")) > width) {
+						parts3 = parts3.filter((p) => p !== modelSeg3);
+					}
+					const right3 = parts3.join(" ");
+					const budget3 = Math.max(0, width - visibleWidth(right3) - 2);
+					const left3 = visibleWidth(left2) > budget3 ? truncateToWidth(left2, budget3) : left2;
+					const pad3 = " ".repeat(Math.max(2, width - visibleWidth(left3) - visibleWidth(right3)));
+					return [left3 + pad3 + right3];
+				}
+
 				return [line1, line2];
 			},
 		};
@@ -586,7 +607,9 @@ export default function (pi: ExtensionAPI) {
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
 	const handler = async (args: string, ctx: ExtensionContext) => {
-		const cmd = args.trim().toLowerCase();
+		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+		const cmd = parts[0] ?? "";
+		const hudArg = parts[1];
 		const adapter = resolveProvider(ctx.model?.id);
 		const modelId = ctx.model?.id;
 
@@ -596,13 +619,44 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// ── /usage footer ──
-		if (cmd === "footer") {
-			footerEnabled = !footerEnabled;
-			if (footerEnabled) {
-				enableFooter(ctx);
-			} else {
-				disableFooter(ctx);
+		// ── /usage hud ── 无参数打开交互抽屉 (开关/布局); on|off 直接开关; footer 为习惯别名
+		if (cmd === "hud" || cmd === "footer") {
+			if (hudArg === "on" || hudArg === "off") {
+				footerEnabled = hudArg === "on";
+				if (footerEnabled) enableFooter(ctx);
+				else disableFooter(ctx);
+				return;
+			}
+			if (!ctx.hasUI) {
+				// 无 TUI 退化为直接开关
+				footerEnabled = !footerEnabled;
+				if (footerEnabled) enableFooter(ctx);
+				else disableFooter(ctx);
+				return;
+			}
+			const current = footerEnabled ? "开" : "关";
+			const layout = getFooterLayout();
+			const action = await ctx.ui.select("HUD 显示设置", [
+				`状态栏: ${current}`,
+				`布局: ${layout === "dual" ? "双行" : "单行"}`,
+			]);
+			if (!action) return;
+			if (action.startsWith("状态栏")) {
+				footerEnabled = !footerEnabled;
+				if (footerEnabled) enableFooter(ctx);
+				else disableFooter(ctx);
+				return;
+			}
+			// 布局选择
+			const layoutChoice = await ctx.ui.select("HUD 布局", [
+				"双行 ⭐推荐 (余额在首行右侧, 对齐原生)",
+				"单行 (紧凑, 余额与统计同行)",
+			]);
+			if (!layoutChoice) return;
+			const next = layoutChoice.startsWith("双行") ? "dual" : "single";
+			if (next !== getFooterLayout()) {
+				setFooterLayout(next);
+				ctx.ui.notify(`HUD 布局已切换为${next === "dual" ? "双行" : "单行"}`, "info");
 			}
 			return;
 		}
@@ -698,13 +752,13 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, footer, status, peak`, "warning");
+		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, hud, status, peak`, "warning");
 	};
 
 	pi.registerCommand("usage", {
-		description: "模型余额和用量查询。子命令: balance, session, footer, status, peak, config",
+		description: "模型余额和用量查询。子命令: balance, session, hud, status, peak, config",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["balance", "session", "footer", "status", "peak", "config"];
+			const subs = ["balance", "session", "hud", "status", "peak", "config"];
 			return subs.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
 		},
 		handler,
@@ -748,7 +802,8 @@ export default function (pi: ExtensionAPI) {
 		if (confirmSyncTimer) clearTimeout(confirmSyncTimer);
 		confirmSyncTimer = setTimeout(() => {
 			confirmSyncTimer = null;
-			void calibrateProvider(providerId);
+			// 恢复路径: 充值后下次对话成功即校准, 差额触发 ▲ 回充翻页动画
+			void calibrateProvider(providerId, { flash: true });
 		}, 3000);
 	};
 
