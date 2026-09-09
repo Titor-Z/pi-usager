@@ -358,6 +358,15 @@ interface FlipAnim {
 let flipAnim: FlipAnim | null = null;
 let footerTui: { requestRender(): void } | null = null;
 
+// ── Git 工作区状态 (第 1 行 branch 后的 +3-5 分色段) ──
+let piRef: ExtensionAPI;
+let gitStaged = 0;        // 已暂存变更文件数 (porcelain X 列)
+let gitUnstaged = 0;      // 未暂存变更文件数 (Y 列, ?? untracked 归入此侧)
+let gitCacheAt = 0;       // 上次成功解析时间戳
+let gitInFlight = false;  // 在途防抖
+let gitDisabled = false;  // 非 git 仓库哨兵, onBranchChange 时重置重新探测
+const GIT_REFRESH_MS = 3000;
+
 function requestFooterRender(): void {
 	footerTui?.requestRender();
 }
@@ -461,7 +470,13 @@ function formatCwdForFooter(cwd: string, home?: string): string {
  */
 function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 	ctx.ui.setFooter((tui, theme, footerData) => {
-		const unsub = footerData.onBranchChange(() => tui.requestRender());
+		const unsub = footerData.onBranchChange(() => {
+			// 切分支: 重置非仓库哨兵并重新探测 git 状态
+			gitDisabled = false;
+			gitCacheAt = 0;
+			refreshGitStatus(ctx.cwd);
+			tui.requestRender();
+		});
 		footerTui = tui;
 
 		// 定时全量校准 (默认 5 分钟): 纠偏本地台账漂移; 发现回充时闪 ▲
@@ -487,11 +502,15 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const balSeg = balanceSegment(theme, adapter.id);
 				const peakSeg = adapter.hasPeakPricing ? theme.fg("dim", isPeakHour() ? "🕸️" : "🦦") : undefined;
 
-				// ── 第 1 行: workdir (branch) • session 名 …… 余额段 (右对齐) ──
-				// 余额/翻页动画/欠费态放这行右侧, 可见性最高
+				// ── 第 1 行: workdir (branch) [+3-5] • session 名 …… 余额段 (右对齐) ──
+				// 余额/翻页动画/欠费态放这行右侧, 可见性最高; git 分色段紧随 branch 之后
+				maybeRefreshGitStatus(ctx.cwd);
 				let pwdLeft = formatCwdForFooter(ctx.cwd, process.env.HOME ?? process.env.USERPROFILE);
 				const branch = footerData.getGitBranch();
 				if (branch) pwdLeft += ` (${branch})`;
+				const pwdBase = pwdLeft; // 降级链回退基线 (仅路径+branch)
+				const gitSeg = branch ? formatGitSegment(theme) : null;
+				if (gitSeg) pwdLeft += ` ${gitSeg}`;
 				const sessionName = ctx.getSessionName?.();
 				if (sessionName) pwdLeft += ` • ${sessionName}`;
 
@@ -502,9 +521,12 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				}
 				const right1 = r1parts.join(" ");
 				const budget1 = Math.max(0, width - visibleWidth(right1) - 2);
-				// 空间不足最先去 session 名 (诊断价值最低), 仍不足再截路径
+				// 降级链: 先去 session 名 (诊断价值最低), 再去 git 分色段, 仍不足才截路径
 				if (visibleWidth(pwdLeft) > budget1 && sessionName) {
-					pwdLeft = pwdLeft.replace(/ • [^•]+$/, "");
+					pwdLeft = pwdBase + (gitSeg ? ` ${gitSeg}` : "");
+				}
+				if (visibleWidth(pwdLeft) > budget1 && gitSeg) {
+					pwdLeft = pwdBase;
 				}
 				const left1 = theme.fg("dim", visibleWidth(pwdLeft) > budget1 ? truncateToWidth(pwdLeft, budget1) : pwdLeft);
 				const pad1 = " ".repeat(Math.max(2, width - visibleWidth(left1) - visibleWidth(right1)));
@@ -598,10 +620,63 @@ function disableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 }
 
 // ═══════════════════════════════════════════
+//  Git 工作区状态 (第 1 行 branch 后的 +3-5 分色段)
+// ═══════════════════════════════════════════
+
+/** 解析 porcelain 输出: X 列 (已暂存) 与 Y 列 (未暂存) 分别计数, ?? untracked 归未暂存侧 */
+function refreshGitStatus(cwd: string): void {
+	if (gitInFlight) return;
+	gitInFlight = true;
+	void piRef.exec("git", ["-C", cwd, "status", "--porcelain=v1", "--branch"])
+		.then((r) => {
+			if (r.code !== 0) {
+				// 非 git 仓库: 空哨兵, 不再反复探测 (切分支时重置)
+				gitDisabled = true;
+			} else {
+				let staged = 0;
+				let unstaged = 0;
+				for (const line of r.stdout.split("\n")) {
+					if (!line || line.startsWith("##")) continue; // branch/ahead-behind 行
+					if (line.startsWith("??")) { unstaged++; continue; }
+					if (line[0] !== " ") staged++;
+					if (line[1] !== " ") unstaged++;
+				}
+				gitStaged = staged;
+				gitUnstaged = unstaged;
+				gitCacheAt = Date.now();
+				debugLog(`git status: +${staged}-${unstaged}`);
+			}
+			requestFooterRender();
+		})
+		.catch(() => {
+			gitDisabled = true;
+		})
+		.finally(() => {
+			gitInFlight = false;
+		});
+}
+
+/** render 内懒触发: 缓存过期且无在途时刷新, 完成后 requestRender 重绘一次 */
+function maybeRefreshGitStatus(cwd: string): void {
+	if (gitDisabled || gitInFlight) return;
+	if (Date.now() - gitCacheAt > GIT_REFRESH_MS) refreshGitStatus(cwd);
+}
+
+/** +3-5 分色: +N 绿 (已暂存), -M 红 (未暂存/untracked); 零值段省略, 全零不显示 */
+function formatGitSegment(theme: Parameters<typeof balanceSegment>[0]): string | null {
+	if (gitDisabled) return null;
+	const parts: string[] = [];
+	if (gitStaged > 0) parts.push(theme.fg("success", `+${gitStaged}`));
+	if (gitUnstaged > 0) parts.push(theme.fg("error", `-${gitUnstaged}`));
+	return parts.length ? parts.join("") : null;
+}
+
+// ═══════════════════════════════════════════
 //  Extension 入口
 // ═══════════════════════════════════════════
 
 export default function (pi: ExtensionAPI) {
+	piRef = pi;
 	let statusEnabled = false;
 	let footerEnabled = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -768,6 +843,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── 每轮对话完成: 本地估算扣减 + 翻页动画 ──
 	pi.on("turn_end", (event, ctx) => {
+		maybeRefreshGitStatus(ctx.cwd); // 编辑类工具改文件后必然经过 turn_end, 顺手刷新 git 状态
 		const adapter = resolveProvider(ctx.model?.id);
 		if (!adapter.queryBalance) return; // 无余额查询能力的 provider 不记台账
 		const u = (event.message as any)?.usage;
