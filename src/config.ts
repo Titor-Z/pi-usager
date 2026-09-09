@@ -14,11 +14,24 @@ export interface BalanceProviderConfig {
 	[key: string]: string;
 }
 
+/** 余额台账的校准层快照 (服务端最后一次返回的权威值) */
+export interface CachedBalance {
+	available: boolean;
+	currency: string;
+	total: string;
+	granted?: string;
+	toppedUp?: string;
+	/** 校准时间 (ms 时间戳) */
+	syncedAt: number;
+}
+
 export interface BalanceConfig {
 	/** providerId → 凭证字段 */
 	providers: Record<string, BalanceProviderConfig>;
 	/** 余额刷新间隔 (分钟), 默认 5 */
 	refreshMinutes?: number;
+	/** 本地余额台账 (校准层持久化): 启动时立即渲染, 再异步校准纠偏 */
+	balanceCache?: Record<string, CachedBalance>;
 }
 
 export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
@@ -49,6 +62,13 @@ export function saveProviderConfig(providerId: string, creds: BalanceProviderCon
 export function clearProviderConfig(providerId: string): void {
 	const config = loadConfig();
 	if (config.providers) delete config.providers[providerId];
+	saveConfig(config);
+}
+
+export function saveBalanceEntry(providerId: string, entry: CachedBalance): void {
+	const config = loadConfig();
+	config.balanceCache = config.balanceCache ?? {};
+	config.balanceCache[providerId] = entry;
 	saveConfig(config);
 }
 

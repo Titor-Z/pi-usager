@@ -94,6 +94,9 @@ export interface ProviderAdapter {
 	hasPeakPricing: boolean;
 	/** 查询账户余额 (provider 无公开 API 时不实现) */
 	queryBalance?(): Promise<BalanceResult>;
+	/** 无歧义的欠费 HTTP 状态码 (如 DeepSeek 402, 实测确认)。有歧义的码 (如 GLM 429,
+	 *  兼具欠费/限速/过载等 11 种业务码) 不在此声明, 由余额查询二次确认判定 */
+	depletionStatuses?: number[];
 	/** 计费口径说明 (按量计费 / 周期 / 套餐等) */
 	billingNote?: string;
 	/** 缓存统计口径说明 */

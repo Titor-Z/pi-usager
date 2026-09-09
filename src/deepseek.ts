@@ -58,6 +58,10 @@ export const deepseekAdapter: ProviderAdapter = {
 
 	// 余额查询委托给 balance.ts (凭证: ~/.pi/pi-usager.json → 环境变量 → auth.json)
 	queryBalance: () => queryBalanceFor("deepseek"),
+
+	// 实测确认 (2026-09-09, 真实欠费账户): 欠费时 HTTP 402 + "Insufficient Balance",
+	// 无歧义, 可立即置欠费态; 余额接口同时返回 is_available: false 作二次印证
+	depletionStatuses: [402],
 };
 
 export { isPeakHour };

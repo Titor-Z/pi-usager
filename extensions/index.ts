@@ -6,6 +6,8 @@
  * 全部抽离到 ../src/ 公共模块, 按 current model 自动切换。
  *
  * 统一人民币 ¥ 计价; 免费模型显示 FREE; 支持限时折扣/峰谷价自动切换。
+ * 余额采用双层台账 (src/ledger.ts): 服务端校准 (启动/定时/手动) + 本地估算扣减,
+ * 启动即显示缓存值; 每轮对话翻页动画 (▼红 / ▲绿); 欠费检测后清零, 缴费后自动恢复。
  *
  * 命令:
  *   /usage            - 显示余额 + 当前会话用量
@@ -22,16 +24,29 @@
 
 import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { resolveProvider } from "../src/index.ts";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { resolveProvider, ADAPTERS } from "../src/index.ts";
 import { isPeakHour } from "../src/deepseek.ts";
 import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "../src/cost.ts";
 import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
+import {
+	getDisplayedBalance, addSpend, calibrate, isDepleted, markDepleted, clearDepleted, needsCalibrate,
+} from "../src/ledger.ts";
 import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes,
 	type BalanceProviderConfig,
 } from "../src/config.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
+
+// ═══════════════════════════════════════════
+//  调试 (PI_USAGER_DEBUG=1 时输出到 stderr, 不影响正常运行)
+// ═══════════════════════════════════════════
+
+const DEBUG = !!process.env.PI_USAGER_DEBUG;
+function debugLog(...args: unknown[]): void {
+	if (DEBUG) console.error("[pi-usager]", ...args);
+}
 
 // ═══════════════════════════════════════════
 //  余额展示
@@ -52,12 +67,6 @@ function formatBalanceText(adapter: ProviderAdapter, balance: ProviderBalance): 
 	if (balance.toppedUp) lines.push(`  💳 充值余额:   ${fmt(balance.toppedUp)}`);
 	if (balance.granted) lines.push(`  🎁 赠送余额:   ${fmt(balance.granted)}`);
 	return lines;
-}
-
-/** 统一入口: 按 providerId 查余额 (adapter.queryBalance 已委托 balance.ts) */
-async function queryBalanceSafe(adapter: ProviderAdapter): Promise<BalanceResult | null> {
-	if (!adapter.queryBalance) return null;
-	return adapter.queryBalance();
 }
 
 /** 敏感字段打码 */
@@ -101,7 +110,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 	}
 	const action = await ctx.ui.select(
 		"使用量配置 (仿 /settings)",
-		["配置厂商凭证", "余额刷新间隔", "清除厂商凭证", "查看当前配置"],
+		["配置厂商凭证", "余额校准间隔", "清除厂商凭证", "查看当前配置"],
 	);
 	if (!action) return;
 
@@ -152,16 +161,16 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 
-	// ── 刷新间隔 ──
-	if (action === "余额刷新间隔") {
-		const minutes = await ctx.ui.input("余额刷新间隔（分钟）", String(getRefreshMinutes()));
+	// ── 校准间隔 ──
+	if (action === "余额校准间隔") {
+		const minutes = await ctx.ui.input("余额校准间隔（分钟，服务端同步纠偏；两次校准间为本地估算）", String(getRefreshMinutes()));
 		const n = parseInt(minutes ?? "", 10);
 		if (isNaN(n) || n < 1) {
 			ctx.ui.notify("无效的分钟数", "warning");
 			return;
 		}
 		setRefreshMinutes(n);
-		ctx.ui.notify(`余额刷新间隔已设为 ${n} 分钟（下次会话生效）`, "info");
+		ctx.ui.notify(`余额校准间隔已设为 ${n} 分钟（下次会话生效）`, "info");
 		return;
 	}
 
@@ -185,7 +194,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 	if (action === "查看当前配置") {
 		const config = loadConfig();
 		const lines: string[] = ["━━━ 使用量配置 ━━━"];
-		lines.push(`  余额刷新间隔: ${getRefreshMinutes()} 分钟`);
+		lines.push(`  余额校准间隔: ${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`);
 		const providers = config.providers ?? {};
 		if (Object.keys(providers).length === 0) {
 			lines.push("  (未配置任何厂商凭证, 将回退环境变量/auth.json)");
@@ -290,8 +299,159 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 }
 
 // ═══════════════════════════════════════════
-//  Footer
+//  余额校准 (统一入口: 所有服务端同步都走这里)
 // ═══════════════════════════════════════════
+
+function adapterById(providerId: string): ProviderAdapter | undefined {
+	return ADAPTERS.find((a) => a.id === providerId);
+}
+
+/**
+ * 校准指定厂商的余额: 真实查询服务端并写入台账 (覆盖缓存 + 清零估算层 + 欠费判定)。
+ * 返回 BalanceResult 供调用方展示; 该厂商不支持余额查询时返回 null。
+ * opts.flash: 校准后发现余额比显示值增加时, 触发 ▲ 回充翻页动画 (如两会话间充了值)。
+ */
+async function calibrateProvider(providerId: string, opts?: { flash?: boolean }): Promise<BalanceResult | null> {
+	const adapter = adapterById(providerId);
+	if (!adapter?.queryBalance) return null;
+	const before = getDisplayedBalance(providerId);
+	const beforeTotal = before && before.available ? parseFloat(before.total) : undefined;
+	const result = await adapter.queryBalance();
+	if (result && isBalance(result)) {
+		calibrate(providerId, result);
+		debugLog(`calibrate ${providerId}: total=${result.total} available=${result.available} before=${beforeTotal}`);
+		// 最小翻页阈值: 过滤本地估算与服务端真实扣费之间的微误差 (实测 ~0.00002 级),
+		// 否则每次启动校准都会闪一下无意义的伪动画
+		const MIN_FLASH_DELTA = 0.01;
+		if (opts?.flash && !isDepleted(providerId) && beforeTotal !== undefined) {
+			const after = parseFloat(result.total);
+			if (after > beforeTotal + MIN_FLASH_DELTA) {
+				startFlip(providerId, after - beforeTotal, "gain", { from: beforeTotal, to: after });
+			} else if (after < beforeTotal - MIN_FLASH_DELTA) {
+				// 校准发现下跌 (免费模型/多会话的真实扣减只在校准时可见): 同样翻页, 不再静默跳变
+				startFlip(providerId, beforeTotal - after, "spend", { from: beforeTotal, to: after });
+			}
+		}
+	}
+	requestFooterRender();
+	return result;
+}
+
+// ═══════════════════════════════════════════
+//  余额翻页动画 (翻卡式)
+// ═══════════════════════════════════════════
+
+/** 扣款 ▼ 红色; 回充 ▲ 绿色; 帧序列: 旧值静置 → 金额帧 → 新值高亮 → 落定 */
+interface FlipAnim {
+	providerId: string;
+	delta: number;                    // 本次变动金额 (绝对值, ¥)
+	kind: "spend" | "gain";
+	frame: number;                    // 0 旧余额 / 1 金额帧 / 2 新余额高亮
+	from?: number;                    // 旧余额 (无则跳过帧 0)
+	to?: number;                      // 新余额 (无则帧 2 落回常态)
+	timers: ReturnType<typeof setTimeout>[];
+}
+
+let flipAnim: FlipAnim | null = null;
+let footerTui: { requestRender(): void } | null = null;
+
+function requestFooterRender(): void {
+	footerTui?.requestRender();
+}
+
+/** 帧时长 (ms): 旧值静置 → 金额帧 → 新值高亮, 总计 ~3s
+ *  对齐 CSS transition 的从容节奏: 每阶段 1s, 让"要变了→变了多少→变成什么"都可读 */
+const FLIP_FRAME_MS = [1000, 1000, 1000];
+
+function startFlip(
+	providerId: string,
+	delta: number,
+	kind: "spend" | "gain",
+	opts?: { from?: number; to?: number },
+): void {
+	stopFlip();
+	const hasFrom = typeof opts?.from === "number";
+	flipAnim = {
+		providerId, delta, kind,
+		frame: hasFrom ? 0 : 1,
+		from: opts?.from, to: opts?.to,
+		timers: [],
+	};
+	debugLog(`startFlip ${providerId} ${kind} delta=${delta} from=${opts?.from} to=${opts?.to}`);
+	let elapsed = 0;
+	FLIP_FRAME_MS.forEach((ms, i) => {
+		elapsed += ms;
+		flipAnim!.timers.push(setTimeout(() => {
+			if (!flipAnim) return;
+			if (i === FLIP_FRAME_MS.length - 1) {
+				flipAnim = null; // 落定, render 恢复常态余额显示
+			} else {
+				flipAnim.frame = i + 1;
+			}
+			requestFooterRender();
+		}, elapsed));
+	});
+}
+
+function stopFlip(): void {
+	if (!flipAnim) return;
+	flipAnim.timers.forEach(clearTimeout);
+	flipAnim = null;
+}
+
+/** 金额显示: <1分钱显示 4 位小数, 其余 2 位 */
+function flipAmount(n: number): string {
+	return n > 0 && n < 0.01 ? n.toFixed(4) : n.toFixed(2);
+}
+
+/**
+ * 渲染 footer 右侧余额段 (返回已着色字符串):
+ * 欠费 ⚠️欠费 > 翻页动画帧 > 常态 💰¥x.xx (负数红色透支预警)。
+ */
+function balanceSegment(
+	theme: { fg(color: string, text: string): string },
+	providerId: string,
+): string | undefined {
+	if (isDepleted(providerId)) {
+		return theme.fg("error", "⚠️欠费");
+	}
+	if (flipAnim && flipAnim.providerId === providerId) {
+		if (flipAnim.frame === 0 && flipAnim.from !== undefined) {
+			// 帧 0: 旧余额静置 (翻页起点)
+			return theme.fg("dim", `💰¥${flipAnim.from.toFixed(2)}`);
+		}
+		if (flipAnim.frame === 1) {
+			// 帧 1: 红色扣款 ▼ / 绿色回充 ▲
+			const arrow = flipAnim.kind === "spend" ? "▼" : "▲";
+			const sign = flipAnim.kind === "spend" ? "-" : "+";
+			return theme.fg(flipAnim.kind === "spend" ? "error" : "success", `${arrow}¥${sign}${flipAmount(flipAnim.delta)}`);
+		}
+		// 帧 2: 新余额短暂高亮 (翻页落点), 随后回落常态 dim
+		if (flipAnim.to !== undefined) {
+			return theme.fg("accent", `💰¥${flipAnim.to.toFixed(2)}`);
+		}
+	}
+	const b = getDisplayedBalance(providerId);
+	if (!b) return undefined;
+	if (!b.available) return theme.fg("error", "⚠️欠费"); // 缓存中的欠费判定 (校准 available=false), 重启后不丢失
+	const total = parseFloat(b.total);
+	const text = `💰¥${total.toFixed(2)}`;
+	return total < 0 ? theme.fg("error", text) : theme.fg("dim", text);
+}
+
+// ═════════════════════════════════════════
+//  Footer (双行, 对齐 pi 0.85.1 原生布局:
+//  第 1 行 workdir (branch) • session 名 …… 余额段; 第 2 行 token 统计 …… 模型名)
+// ═══════════════════════════════════════════
+
+/** 与原生 footer 同款: HOME 下的路径缩写为 ~ 前缀 */
+function formatCwdForFooter(cwd: string, home?: string): string {
+	if (!home) return cwd;
+	const rel = relative(resolve(home), resolve(cwd));
+	const inside = rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+	if (!inside) return cwd;
+	return rel === "" ? "~" : `~${sep}${rel}`;
+}
 
 /**
  * 开启专属状态栏。费用显示 "此次回答预估价/会话累计预估价"。
@@ -299,28 +459,20 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		const unsub = footerData.onBranchChange(() => tui.requestRender());
+		footerTui = tui;
 
-		// 余额按 provider 分别缓存 (切模型后无需重新拉取)
-		const balances = new Map<string, string>();
-		const refreshMinutes = getRefreshMinutes();
-		const doRefreshBalance = async () => {
-			// 每次 tick 动态解析 provider, 修复 session_start 时模型未选中导致余额不显示的 bug
+		// 定时全量校准 (默认 5 分钟): 纠偏本地台账漂移; 发现回充时闪 ▲
+		const balTimer = setInterval(() => {
 			const adapter = resolveProvider(ctx.model?.id);
-			const b = await queryBalanceSafe(adapter);
-			if (b && isBalance(b) && b.available) {
-				balances.set(adapter.id, `💰¥${parseFloat(b.total).toFixed(2)}`);
-				tui.requestRender();
-			} else if (b && "error" in b) {
-				balances.delete(adapter.id);
-			}
-		};
-		doRefreshBalance();
-		const balTimer = setInterval(doRefreshBalance, refreshMinutes * 60 * 1000);
+			if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
+		}, getRefreshMinutes() * 60 * 1000);
 
 		return {
 			dispose: () => {
 				unsub();
 				clearInterval(balTimer);
+				stopFlip();
+				if (footerTui === tui) footerTui = null;
 			},
 			invalidate() {},
 			render(width: number): string[] {
@@ -329,13 +481,38 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const usage = getSessionUsage(ctx);
 				const { total, lastTurn } = usage;
 				const cost = calculateCost(adapter, modelId, total);
+				const balSeg = balanceSegment(theme, adapter.id);
+				const peakSeg = adapter.hasPeakPricing ? theme.fg("dim", isPeakHour() ? "🕸️" : "🦦") : undefined;
 
-				// 左半: [ PLAN ] ↑42k ↓11k R661k CH99.1% ¥0.02/¥0.08
-				let left = "";
+				// ── 第 1 行: workdir (branch) • session 名 …… 余额段 (右对齐) ──
+				// 余额/翻页动画/欠费态放这行右侧, 可见性最高
+				let pwdLeft = formatCwdForFooter(ctx.cwd, process.env.HOME ?? process.env.USERPROFILE);
+				const branch = footerData.getGitBranch();
+				if (branch) pwdLeft += ` (${branch})`;
+				const sessionName = ctx.getSessionName?.();
+				if (sessionName) pwdLeft += ` • ${sessionName}`;
+
+				// 第 1 行右侧降级链: 峰谷图标先丢, 余额段最后才可能被截
+				let r1parts = [balSeg, peakSeg].filter((p): p is string => p !== undefined);
+				if (peakSeg && visibleWidth(r1parts.join(" ")) > width) {
+					r1parts = r1parts.filter((p) => p !== peakSeg);
+				}
+				const right1 = r1parts.join(" ");
+				const budget1 = Math.max(0, width - visibleWidth(right1) - 2);
+				// 空间不足最先去 session 名 (诊断价值最低), 仍不足再截路径
+				if (visibleWidth(pwdLeft) > budget1 && sessionName) {
+					pwdLeft = pwdLeft.replace(/ • [^•]+$/, "");
+				}
+				const left1 = theme.fg("dim", visibleWidth(pwdLeft) > budget1 ? truncateToWidth(pwdLeft, budget1) : pwdLeft);
+				const pad1 = " ".repeat(Math.max(2, width - visibleWidth(left1) - visibleWidth(right1)));
+				const line1 = left1 + pad1 + right1;
+
+				// ── 第 2 行: [ PLAN ] token 统计 + 费用 + 上下文 …… 模型名 (右对齐) ──
+				let left2 = "";
 				// 可选集成: 若安装了 plan-mode 类扩展, 显示其状态 (软检测, 无硬依赖)
 				const planStatus = footerData.getExtensionStatuses().get("plan-mode");
 				if (planStatus) {
-					left += planStatus + " ";
+					left2 += planStatus + " ";
 				}
 				let costText = fmtCurrency(cost.totalCNY, cost.free);
 				if (lastTurn) {
@@ -347,7 +524,7 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价" && !cost.free) {
 					costText += `·${cost.variantLabel}`;
 				}
-				left += theme.fg(
+				left2 += theme.fg(
 					"dim",
 					`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} CH${hitRate(total.input, total.cacheRead)}% ${costText}`,
 				);
@@ -357,28 +534,32 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					const cu = ctx.getContextUsage();
 					if (cu && ctx.model?.contextWindow) {
 						const pct = ((cu.tokens / ctx.model.contextWindow) * 100).toFixed(1);
-						left += ` ${theme.fg("dim", `${pct}%/${fmtTokens(ctx.model.contextWindow)}`)}`;
+						left2 += ` ${theme.fg("dim", `${pct}%/${fmtTokens(ctx.model.contextWindow)}`)}`;
 					}
 				} catch { /* ignore */ }
 
-				// 思考深度
-				const tl = ctx.thinkingLevel;
-				if (tl) {
-					left += ` ${theme.fg("dim", `· ${tl}`)}`;
-				}
+				// 思考深度: 不再左侧重复显示 —— 右侧模型名已带 `• level` (与原生 footer 一致)
 
-				// 右半: 模型名 + 余额 (+ 峰谷标记, 仅峰谷计费的 provider)
-				const rightParts: string[] = [];
-				if (modelId) rightParts.push(modelId);
-				const currentBalance = balances.get(adapter.id);
-				if (currentBalance) rightParts.push(currentBalance);
-				if (adapter.hasPeakPricing) {
-					rightParts.push(isPeakHour() ? "🕸️" : "🦦");
+				// 第 2 行右侧: 模型名 (多 provider 时带 provider 前缀, 与原生一致; 空间不足回退裸名)
+				const modelName = modelId ?? "no-model";
+				let right2 = modelName;
+				if (ctx.model?.reasoning) {
+					right2 = `${modelName} • ${ctx.thinkingLevel ?? "off"}`;
 				}
-				let right = theme.fg("dim", rightParts.join(" "));
+				if (footerData.getAvailableProviderCount() > 1 && ctx.model?.provider) {
+					const withProvider = `(${ctx.model.provider}) ${right2}`;
+					if (visibleWidth(left2) + 2 + visibleWidth(withProvider) <= width) {
+						right2 = withProvider;
+					}
+				}
+				const right2W = visibleWidth(right2);
+				// 右对齐优先: 空间不足先截左半 (token/费用是诊断信息, 可截), 模型名保住
+				const budget2 = Math.max(0, width - right2W - 2);
+				const left2Shown = visibleWidth(left2) > budget2 ? truncateToWidth(left2, budget2) : left2;
+				const pad2 = " ".repeat(Math.max(2, width - visibleWidth(left2Shown) - right2W));
+				const line2 = left2Shown + pad2 + theme.fg("dim", right2);
 
-				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-				return [truncateToWidth(left + pad + right, width)];
+				return [line1, line2];
 			},
 		};
 	});
@@ -429,12 +610,18 @@ export default function (pi: ExtensionAPI) {
 		// ── /usage status ──
 		if (cmd === "status") {
 			statusEnabled = !statusEnabled;
-			const setStatus = (b: BalanceResult | null) => {
-				if (b && isBalance(b) && b.available) {
-					const peak = adapter.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
-					ctx.ui.setStatus(adapter.id, `${adapter.name} ¥${parseFloat(b.total).toFixed(2)}${peak}`);
+			const setStatusFor = (pid: string, b: BalanceResult | null | undefined) => {
+				const current = adapterById(pid);
+				if (!current) return;
+				if (b && isBalance(b) && isDepleted(pid)) {
+					ctx.ui.setStatus(pid, `${current.name} ⚠️欠费`);
+				} else if (b && isBalance(b) && b.available) {
+					const total = parseFloat(b.total);
+					const peak = current.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
+					const text = `💰¥${total.toFixed(2)}`;
+					ctx.ui.setStatus(pid, total < 0 ? `${current.name} ${text}（透支预警）${peak}` : `${current.name} ${text}${peak}`);
 				} else if (b && "error" in b) {
-					ctx.ui.setStatus(adapter.id, `${adapter.name}: ${b.error}`);
+					ctx.ui.setStatus(pid, `${current.name}: ${b.error}`);
 				}
 			};
 			if (statusEnabled) {
@@ -443,19 +630,15 @@ export default function (pi: ExtensionAPI) {
 					statusEnabled = false;
 					return;
 				}
-				setStatus(await adapter.queryBalance());
-				ctx.ui.notify(`${adapter.name} 余额已显示在状态栏（每5分钟自动刷新）`, "info");
+				setStatusFor(adapter.id, await calibrateProvider(adapter.id));
+				ctx.ui.notify(`${adapter.name} 余额已显示在状态栏（每 ${getRefreshMinutes()} 分钟自动校准，对话间为本地估算）`, "info");
 				if (!refreshTimer) {
 					refreshTimer = setInterval(async () => {
 						if (!statusEnabled) return;
 						// 动态解析: 切换模型后状态栏跟随当前 provider
 						const current = resolveProvider(ctx.model?.id);
 						if (!current.queryBalance) return;
-						const b = await current.queryBalance();
-						if (b && isBalance(b) && b.available) {
-							const peak = current.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
-							ctx.ui.setStatus(current.id, `${current.name} ¥${parseFloat(b.total).toFixed(2)}${peak}`);
-						}
+						setStatusFor(current.id, await calibrateProvider(current.id));
 					}, getRefreshMinutes() * 60 * 1000);
 				}
 			} else {
@@ -469,18 +652,20 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// ── /usage balance ──
+		// ── /usage balance ── 手动校准 (同步台账 + 回充时闪 ▲)
 		if (cmd === "balance") {
 			if (!adapter.queryBalance) {
 				ctx.ui.notify(`${adapter.name} 暂无公开余额查询 API`, "warning");
 				return;
 			}
-			const balance = await adapter.queryBalance();
-			if ("error" in balance) {
+			const balance = await calibrateProvider(adapter.id, { flash: true });
+			if (balance && "error" in balance) {
 				ctx.ui.notify(balance.error, "error");
 				return;
 			}
-			ctx.ui.notify(formatBalanceText(adapter, balance).join("\n"), "info");
+			if (balance && isBalance(balance)) {
+				ctx.ui.notify(formatBalanceText(adapter, balance).join("\n"), "info");
+			}
 			return;
 		}
 
@@ -500,11 +685,11 @@ export default function (pi: ExtensionAPI) {
 		// ── /usage (无参数) ──
 		if (cmd === "") {
 			const stats = getSessionUsage(ctx);
-			const balance = adapter.queryBalance ? await adapter.queryBalance() : null;
+			const balance = adapter.queryBalance ? await calibrateProvider(adapter.id) : null;
 			const lines: string[] = [];
 			if (balance && "error" in balance) {
 				lines.push(`⚠️  ${balance.error}`);
-			} else if (balance) {
+			} else if (balance && isBalance(balance)) {
 				lines.push(...formatBalanceText(adapter, balance));
 			}
 			lines.push("");
@@ -527,14 +712,89 @@ export default function (pi: ExtensionAPI) {
 
 	// （无向后兼容别名：pi-usager 是独立新包，统一使用 /usage）
 
-	// ── 选中支持余额查询的模型时自动显示余额 ──
+	// ── 每轮对话完成: 本地估算扣减 + 翻页动画 ──
+	pi.on("turn_end", (event, ctx) => {
+		const adapter = resolveProvider(ctx.model?.id);
+		if (!adapter.queryBalance) return; // 无余额查询能力的 provider 不记台账
+		const u = (event.message as any)?.usage;
+		if (!u) return;
+		const cost = calculateCost(adapter, ctx.model?.id, {
+			input: u.input ?? 0,
+			output: u.output ?? 0,
+			cacheRead: u.cacheRead ?? 0,
+			cacheWrite: u.cacheWrite ?? 0,
+		});
+		if (cost.free || cost.totalCNY <= 0) {
+			debugLog(`turn_end ${adapter.id}: FREE/零费用, 不扣减不翻页`);
+			return; // FREE 模型不扣减不翻页
+		}
+		const before = getDisplayedBalance(adapter.id);
+		addSpend(adapter.id, cost.totalCNY);
+		const after = getDisplayedBalance(adapter.id);
+		debugLog(`turn_end ${adapter.id}: cost=${cost.totalCNY.toFixed(4)}, before=${before?.total}, after=${after?.total}`);
+		if (ctx.hasUI && footerEnabled) {
+			startFlip(adapter.id, cost.totalCNY, "spend", {
+				from: before && before.available ? parseFloat(before.total) : undefined,
+				to: after && after.available ? parseFloat(after.total) : undefined,
+			});
+		}
+		requestFooterRender();
+	});
+
+	// ── 欠费检测与恢复 ──
+	let confirmSyncTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 错误响应后延迟确认余额 (防抖; calibrate 的判定是欠费态的权威结论) */
+	const scheduleConfirmSync = (providerId: string) => {
+		if (confirmSyncTimer) clearTimeout(confirmSyncTimer);
+		confirmSyncTimer = setTimeout(() => {
+			confirmSyncTimer = null;
+			void calibrateProvider(providerId);
+		}, 3000);
+	};
+
+	pi.on("after_provider_response", (event, ctx) => {
+		const adapter = resolveProvider(ctx.model?.id);
+		if (!adapter.queryBalance || event.status === undefined) return;
+		debugLog(`after_provider_response ${adapter.id}: status=${event.status} depleted=${isDepleted(adapter.id)}`);
+		if (event.status < 400) {
+			// 请求成功 = 账户可用: 若此前置了欠费态, 立即解除并校准带回真实数值
+			// (这就是缴费后的恢复路径: 用户充值后下一次对话即恢复)
+			if (isDepleted(adapter.id)) {
+				clearDepleted(adapter.id);
+				scheduleConfirmSync(adapter.id);
+				requestFooterRender();
+			}
+			return;
+		}
+		// 请求失败: 无歧义欠费码 (如 DeepSeek 402) 立即清零; 歧义码 (如 GLM 429)
+		// 不直接判定, 由延迟的余额确认查询经 calibrate() 给出权威结论
+		if (adapter.depletionStatuses?.includes(event.status)) {
+			markDepleted(adapter.id);
+			requestFooterRender();
+		}
+		scheduleConfirmSync(adapter.id);
+	});
+
+	// ── 选中支持余额查询的模型时: 台账过期/欠费态则校准, 否则直接用缓存显示 ──
 	pi.on("model_select", async (event, ctx) => {
 		const adapter = resolveProvider(event.model?.id);
-		if (adapter.queryBalance && !footerEnabled && !statusEnabled) {
-			const balance = await adapter.queryBalance();
-			if (isBalance(balance) && balance.available) {
+		if (!adapter.queryBalance) return;
+		const intervalMs = getRefreshMinutes() * 60 * 1000;
+		let result: BalanceResult | null = null;
+		if (needsCalibrate(adapter.id, intervalMs) || isDepleted(adapter.id)) {
+			result = await calibrateProvider(adapter.id, { flash: true });
+		} else {
+			requestFooterRender();
+		}
+		if (footerEnabled) return;
+		// 未开 footer 时走原状态栏路径
+		const b = result && isBalance(result) ? result : getDisplayedBalance(adapter.id);
+		if (b && isBalance(b)) {
+			if (isDepleted(adapter.id)) {
+				ctx.ui.setStatus(adapter.id, `${adapter.name} ⚠️欠费`);
+			} else if (b.available) {
 				const peak = adapter.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
-				ctx.ui.setStatus(adapter.id, `${adapter.name} ¥${parseFloat(balance.total).toFixed(2)}${peak}`);
+				ctx.ui.setStatus(adapter.id, `${adapter.name} 💰¥${parseFloat(b.total).toFixed(2)}${peak}`);
 			}
 		}
 	});
@@ -543,6 +803,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		footerEnabled = true;
 		enableFooter(ctx, { silent: true });
+		// 启动即显示持久化缓存; 异步校准纠偏 (两会话间充了值会闪 ▲)
+		const adapter = resolveProvider(ctx.model?.id);
+		if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
 	});
 
 	// ── 清理 ──
@@ -551,5 +814,6 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(refreshTimer);
 			refreshTimer = null;
 		}
+		stopFlip();
 	});
 }
