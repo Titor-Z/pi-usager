@@ -38,7 +38,7 @@ import {
 	type BalanceProviderConfig,
 } from "../src/config.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
-import { sectionTitle, subTitle, kv, box, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
+import { sectionTitle, subTitle, kv, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
 
 // ═══════════════════════════════════════════
 //  调试 (PI_USAGER_DEBUG=1 时输出到 stderr, 不影响正常运行)
@@ -266,7 +266,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 				if (v !== undefined) lines.push(`    ${kv(field.label, maskValue(field, v), 14)}`);
 			}
 		}
-		ctx.ui.notify(box(lines).join("\n"), "info");
+		ctx.ui.notify(lines.join("\n"), "info");
 	}
 }
 
@@ -766,7 +766,7 @@ export default function (pi: ExtensionAPI) {
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
-			ctx.ui.notify(box(formatVariantStatus(adapter, modelId)).join("\n"), "info");
+			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
 			return;
 		}
 
@@ -827,7 +827,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (balance && isBalance(balance)) {
-				ctx.ui.notify(box(formatBalanceText(adapter, balance)).join("\n"), "info");
+				ctx.ui.notify(formatBalanceText(adapter, balance).join("\n"), "info");
 			}
 			return;
 		}
@@ -841,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 		// ── /usage session ──
 		if (cmd === "session") {
 			const stats = getSessionUsage(ctx);
-			ctx.ui.notify(box(formatUsageText(adapter, stats, modelId)).join("\n"), "info");
+			ctx.ui.notify(formatUsageText(adapter, stats, modelId).join("\n"), "info");
 			return;
 		}
 
@@ -853,10 +853,10 @@ export default function (pi: ExtensionAPI) {
 			if (balance && "error" in balance) {
 				lines.push(`⚠️  ${balance.error}`);
 			} else if (balance && isBalance(balance)) {
-				lines.push(...box(formatBalanceText(adapter, balance)));
+				lines.push(...formatBalanceText(adapter, balance));
 			}
 			lines.push("");
-			lines.push(...box(formatUsageText(adapter, stats, modelId)));
+			lines.push(...formatUsageText(adapter, stats, modelId));
 			ctx.ui.notify(lines.join("\n"), "info");
 			return;
 		}

@@ -18,10 +18,10 @@ export const BORDER = "\x1b[38;5;240m";
 /** 紫色 (256 色 141) — CH ≥95% 优秀档 */
 export const PURPLE = "\x1b[38;5;141m";
 
-/** card 宽度 (notify 场景拿不到终端宽度, 取安全固定值) */
-const BOX_WIDTH = 56;
-
-/** 区块标题: ▎竖线 + accent 色 (替代 ━━━ 长线) */
+/** card 宽度 → 已废弃边框；终端宽度每次实时读 (模块加载时 TUI 可能未就绪)，非 TTY 回退 80 */
+export function getTermWidth(): number {
+	return process.stdout?.columns ?? 80;
+}
 export function sectionTitle(text: string): string {
 	return `${ACCENT}▎ ${text}${RESET}`;
 }
@@ -40,33 +40,39 @@ export function kv(label: string, value: string, labelWidth = 18): string {
 	return `${label}${" ".repeat(pad)}${value}`;
 }
 
-/** card 上下边框横线 (border 色) */
-function rule(): string {
-	return `${BORDER}${"─".repeat(BOX_WIDTH)}${RESET}`;
-}
-
-/** 整块输出包裹上下边框, 成为一个 card */
-export function box(lines: string[]): string[] {
-	return [rule(), ...lines, rule()];
-}
-
 /**
  * 长说明悬挂缩进换行: 续行与首行内容列对齐 (统一缩进, 不顶格)。
+ * 优先在行内最后一个空格/CJK 标点处断行 (不切碎词语); 无断点才按字符断。
  * prefix 为首行前缀 (含缩进), hangIndent 为续行缩进。
  */
+const BREAK_CHARS = new Set([" ", "，", "、", "；", "。", "：", "）"]);
+
 export function noteWrap(text: string, prefix: string, hangIndent: string): string[] {
 	const out: string[] = [];
+	const width = getTermWidth() - 2;
 	let line = prefix;
 	let cur = visibleWidth(prefix);
 	for (const ch of text) {
 		const w = visibleWidth(ch);
-		if (cur + w > BOX_WIDTH - 2) {
-			out.push(line);
-			line = hangIndent;
-			cur = visibleWidth(hangIndent);
+		if (cur + w > width) {
+			// 回退到行内最后一个断点, 断点后的内容挪到续行
+			let cut = -1;
+			for (let i = line.length - 1; i > hangIndent.length; i--) {
+				if (BREAK_CHARS.has(line[i])) { cut = i; break; }
+			}
+			if (cut > 0) {
+				const rest = line.slice(cut + 1).trimStart();
+				out.push(line.slice(0, cut + 1).trimEnd());
+				line = hangIndent + rest;
+				cur = visibleWidth(line);
+			} else {
+				out.push(line);
+				line = hangIndent;
+				cur = visibleWidth(hangIndent);
+			}
 		}
 		line += ch;
-		cur += w;
+		cur += visibleWidth(ch);
 	}
 	out.push(line);
 	return out;
