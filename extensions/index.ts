@@ -13,7 +13,6 @@
  *   /usage            - 显示余额 + 当前会话用量
  *   /usage balance    - 仅查余额
  *   /usage session    - 仅查当前会话用量（含详细计费 + 最近一次回答费用）
- *   /usage hud        - HUD 显示设置抽屉 (开关/布局); /usage hud on|off 直接开关
  *   /usage status     - 切换状态栏余额显示
  *   /usage peak       - 当前生效的计价变体（峰谷/限时折扣）及切换时间
  *   /usage config     - 交互式配置（凭证/刷新间隔）
@@ -110,8 +109,16 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 	const action = await ctx.ui.select(
-		"使用量配置 (仿 /settings)",
-		["配置厂商凭证", "余额校准间隔", "清除厂商凭证", "查看当前配置"],
+		"使用量配置",
+		[
+			"配置厂商凭证",
+			"余额校准间隔",
+			`HUD 状态栏: ${footerEnabled ? "开" : "关"}`,
+			`HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`,
+			`余额颜色: 提醒线 ¥${getBalanceColorThresholds().yellow.toFixed(2)} / 告急线 ¥${getBalanceColorThresholds().red.toFixed(2)}`,
+			"清除厂商凭证",
+			"查看当前配置",
+		],
 	);
 	if (!action) return;
 
@@ -172,6 +179,53 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		}
 		setRefreshMinutes(n);
 		ctx.ui.notify(`余额校准间隔已设为 ${n} 分钟（下次会话生效）`, "info");
+		return;
+	}
+
+	// ── HUD 状态栏开关 ──
+	if (action.startsWith("HUD 状态栏")) {
+		footerEnabled = !footerEnabled;
+		if (footerEnabled) enableFooter(ctx);
+		else disableFooter(ctx);
+		return;
+	}
+
+	// ── HUD 布局 ──
+	if (action.startsWith("HUD 布局")) {
+		const layoutChoice = await ctx.ui.select("HUD 布局", [
+			"双行 ⭐推荐 (余额在首行右侧, 对齐原生)",
+			"单行 (紧凑, 余额与统计同行)",
+		]);
+		if (!layoutChoice) return;
+		const next = layoutChoice.startsWith("双行") ? "dual" : "single";
+		if (next !== getFooterLayout()) {
+			setFooterLayout(next);
+			ctx.ui.notify(`HUD 布局已切换为${next === "dual" ? "双行" : "单行"}`, "info");
+		}
+		return;
+	}
+
+	// ── 余额颜色 (两个输入框: 提醒线/告急线, 回车跳过不改) ──
+	if (action.startsWith("余额颜色")) {
+		const cur = getBalanceColorThresholds();
+		const yellowStr = await ctx.ui.input(`余额提醒线 (黄色, 当前 ¥${cur.yellow.toFixed(2)})`, cur.yellow.toFixed(2));
+		const yellow = yellowStr === undefined || yellowStr === "" ? cur.yellow : parseFloat(yellowStr);
+		if (Number.isNaN(yellow) || yellow < 0) {
+			ctx.ui.notify("提醒线无效, 未保存", "warning");
+			return;
+		}
+		const redStr = await ctx.ui.input(`余额告急线 (红色, 当前 ¥${cur.red.toFixed(2)})`, cur.red.toFixed(2));
+		const red = redStr === undefined || redStr === "" ? cur.red : parseFloat(redStr);
+		if (Number.isNaN(red) || red < 0) {
+			ctx.ui.notify("告急线无效, 未保存", "warning");
+			return;
+		}
+		// 红线应低于黄线: 倒置时交换并提示
+		const [y, r] = yellow >= red ? [yellow, red] : [red, yellow];
+		if (y !== yellow) ctx.ui.notify("两条线大小倒置, 已自动交换", "info");
+		setBalanceColorThresholds(y, r);
+		ctx.ui.notify(`余额颜色已更新: 提醒线 ¥${y.toFixed(2)} / 告急线 ¥${r.toFixed(2)}`, "info");
+		requestFooterRender();
 		return;
 	}
 
@@ -360,6 +414,7 @@ interface FlipAnim {
 
 let flipAnim: FlipAnim | null = null;
 let footerTui: { requestRender(): void } | null = null;
+let footerEnabled = false; // HUD 状态栏开关 (configFlow 与 handler 共享)
 
 // ── Git 工作区状态 (第 1 行 branch 后的 +3-5 分色段) ──
 let piRef: ExtensionAPI;
@@ -454,7 +509,7 @@ function balanceSegment(
 	// 透支预警不变红; 分档色: < 告急线红 (告急) → < 提醒线黄 (提醒) → 否则绿 (充裕)
 	if (total < 0) return theme.fg("error", text);
 	const { yellow, red } = getBalanceColorThresholds();
-	const color = total < red ? "error" : total < yellow ? "warning" : "success";
+	const color = total < red ? "error" : total < yellow ? "warning" : "accent";
 	return theme.fg(color, text);
 }
 
@@ -556,10 +611,26 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价" && !cost.free) {
 					costText += `·${cost.variantLabel}`;
 				}
-				left2 += theme.fg(
-					"dim",
-					`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} CH${hitRate(total.input, total.cacheRead)}% ${costText}`,
-				);
+				// CH 缓存命中率分色: <90% dim (常态) / 90~95% accent 主题蓝 (良好) / ≥95% 紫 (优秀, ANSI 绕过主题)
+				const chRate = parseFloat(hitRate(total.input, total.cacheRead));
+				const CH_GREEN = 90;
+				const CH_PURPLE = 95;
+				const PURPLE_ANSI = "\x1b[38;5;141m";
+				const chText = `CH${chRate}%`;
+				const chStyled = chRate >= CH_PURPLE
+					? `${PURPLE_ANSI}${chText}\x1b[0m`
+					: chRate >= CH_GREEN ? theme.fg("accent", chText) : null;
+				if (chStyled) {
+					left2 += theme.fg(
+						"dim",
+						`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} `,
+					) + `${chStyled} ` + theme.fg("dim", costText);
+				} else {
+					left2 += theme.fg(
+						"dim",
+						`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} ${chText} ${costText}`,
+					);
+				}
 
 				// 上下文使用率
 				try {
@@ -691,79 +762,12 @@ export default function (pi: ExtensionAPI) {
 	const handler = async (args: string, ctx: ExtensionContext) => {
 		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 		const cmd = parts[0] ?? "";
-		const hudArg = parts[1];
 		const adapter = resolveProvider(ctx.model?.id);
 		const modelId = ctx.model?.id;
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
 			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
-			return;
-		}
-
-		// ── /usage hud ── 无参数打开交互抽屉 (开关/布局); on|off 直接开关; footer 为习惯别名
-		if (cmd === "hud" || cmd === "footer") {
-			if (hudArg === "on" || hudArg === "off") {
-				footerEnabled = hudArg === "on";
-				if (footerEnabled) enableFooter(ctx);
-				else disableFooter(ctx);
-				return;
-			}
-			if (!ctx.hasUI) {
-				// 无 TUI 退化为直接开关
-				footerEnabled = !footerEnabled;
-				if (footerEnabled) enableFooter(ctx);
-				else disableFooter(ctx);
-				return;
-			}
-			const current = footerEnabled ? "开" : "关";
-			const layout = getFooterLayout();
-			const thresholds = getBalanceColorThresholds();
-			const action = await ctx.ui.select("HUD 显示设置", [
-				`状态栏: ${current}`,
-				`布局: ${layout === "dual" ? "双行" : "单行"}`,
-				`余额颜色: 提醒线 ¥${thresholds.yellow.toFixed(2)} / 告急线 ¥${thresholds.red.toFixed(2)}`,
-			]);
-			if (!action) return;
-			if (action.startsWith("状态栏")) {
-				footerEnabled = !footerEnabled;
-				if (footerEnabled) enableFooter(ctx);
-				else disableFooter(ctx);
-				return;
-			}
-			if (action.startsWith("余额颜色")) {
-				// 二级输入: 提醒线 (黄) / 告急线 (红), 直接回车跳过不改
-				const yellowStr = await ctx.ui.input(`余额提醒线 (黄色, 当前 ¥${thresholds.yellow.toFixed(2)})`, thresholds.yellow.toFixed(2));
-				const yellow = yellowStr === undefined || yellowStr === "" ? thresholds.yellow : parseFloat(yellowStr);
-				if (Number.isNaN(yellow) || yellow < 0) {
-					ctx.ui.notify("提醒线无效, 未保存", "warning");
-					return;
-				}
-				const redStr = await ctx.ui.input(`余额告急线 (红色, 当前 ¥${thresholds.red.toFixed(2)})`, thresholds.red.toFixed(2));
-				const red = redStr === undefined || redStr === "" ? thresholds.red : parseFloat(redStr);
-				if (Number.isNaN(red) || red < 0) {
-					ctx.ui.notify("告急线无效, 未保存", "warning");
-					return;
-				}
-				// 红线应低于黄线: 倒置时交换并提示
-				let [y, r] = yellow >= red ? [yellow, red] : [red, yellow];
-				if (y !== yellow) ctx.ui.notify("两条线大小倒置, 已自动交换", "info");
-				setBalanceColorThresholds(y, r);
-				ctx.ui.notify(`余额颜色已更新: 提醒线 ¥${y.toFixed(2)} / 告急线 ¥${r.toFixed(2)}`, "info");
-				requestFooterRender();
-				return;
-			}
-			// 布局选择
-			const layoutChoice = await ctx.ui.select("HUD 布局", [
-				"双行 ⭐推荐 (余额在首行右侧, 对齐原生)",
-				"单行 (紧凑, 余额与统计同行)",
-			]);
-			if (!layoutChoice) return;
-			const next = layoutChoice.startsWith("双行") ? "dual" : "single";
-			if (next !== getFooterLayout()) {
-				setFooterLayout(next);
-				ctx.ui.notify(`HUD 布局已切换为${next === "dual" ? "双行" : "单行"}`, "info");
-			}
 			return;
 		}
 
@@ -829,7 +833,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// ── /usage config ── 交互式配置 (仿 /settings)
+		// ── /usage config ── 交互式配置
 		if (cmd === "config") {
 			await configFlow(ctx);
 			return;
@@ -858,14 +862,20 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, hud, status, peak`, "warning");
+		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, status, peak, config\n配置相关 (HUD 开关/布局/余额颜色等) 已统一收进 /usage config`, "warning");
 	};
 
 	pi.registerCommand("usage", {
-		description: "模型余额和用量查询。子命令: balance, session, hud, status, peak, config",
+		description: "余额与用量监控",
 		getArgumentCompletions: (prefix: string) => {
-			const subs = ["balance", "session", "hud", "status", "peak", "config"];
-			return subs.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
+			const items = [
+				{ value: "balance", description: "立即校准余额并显示" },
+				{ value: "session", description: "本次会话用量统计" },
+				{ value: "status", description: "开关状态栏余额显示" },
+				{ value: "peak", description: "当前计价档位 (峰谷/限时折扣)" },
+				{ value: "config", description: "配置菜单 (凭证/校准/HUD/颜色)" },
+			];
+			return items.filter((i) => i.value.startsWith(prefix)).map((i) => ({ value: i.value, label: i.value, description: i.description }));
 		},
 		handler,
 	});
