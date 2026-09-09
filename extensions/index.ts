@@ -38,6 +38,7 @@ import {
 	type BalanceProviderConfig,
 } from "../src/config.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
+import { sectionTitle, subTitle, kv, box, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
 
 // ═══════════════════════════════════════════
 //  调试 (PI_USAGER_DEBUG=1 时输出到 stderr, 不影响正常运行)
@@ -57,15 +58,15 @@ function isBalance(r: BalanceResult): r is ProviderBalance {
 }
 
 function formatBalanceText(adapter: ProviderAdapter, balance: ProviderBalance): string[] {
-	const lines: string[] = [`━━━ ${adapter.name} 账户余额 ━━━`];
+	const lines: string[] = [sectionTitle(`账户余额 · ${adapter.name}`), ""];
 	if (!balance.available) {
-		lines.push("⚠️  账户当前不可用");
+		lines.push("  ⚠️ 账户当前不可用");
 		return lines;
 	}
 	const fmt = (n: string) => `¥${parseFloat(n).toFixed(2)}`;
-	lines.push(`  💸 总余额:     ${fmt(balance.total)}`);
-	if (balance.toppedUp) lines.push(`  💳 充值余额:   ${fmt(balance.toppedUp)}`);
-	if (balance.granted) lines.push(`  🎁 赠送余额:   ${fmt(balance.granted)}`);
+	lines.push(`  ${kv("总余额", fmt(balance.total), 10)}`);
+	if (balance.toppedUp) lines.push(`  ${kv("充值余额", fmt(balance.toppedUp), 10)}`);
+	if (balance.granted) lines.push(`  ${kv("赠送余额", fmt(balance.granted), 10)}`);
 	return lines;
 }
 
@@ -248,24 +249,24 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 	// ── 查看当前配置 ──
 	if (action === "查看当前配置") {
 		const config = loadConfig();
-		const lines: string[] = ["━━━ 使用量配置 ━━━"];
-		lines.push(`  余额校准间隔: ${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`);
-		lines.push(`  HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`);
+		const lines: string[] = [sectionTitle("使用量配置"), ""];
+		lines.push(`  ${kv("余额校准间隔", `${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`)}`);
+		lines.push(`  ${kv("HUD 布局", getFooterLayout() === "dual" ? "双行" : "单行")}`);
 		const bc = getBalanceColorThresholds();
-		lines.push(`  余额颜色: 提醒线 ¥${bc.yellow.toFixed(2)} (黄) / 告急线 ¥${bc.red.toFixed(2)} (红) / 其余绿`);
+		lines.push(`  ${kv("余额颜色", `提醒线 ¥${bc.yellow.toFixed(2)} / 告急线 ¥${bc.red.toFixed(2)}`)}`);
 		const providers = config.providers ?? {};
 		if (Object.keys(providers).length === 0) {
-			lines.push("  (未配置任何厂商凭证, 将回退环境变量/auth.json)");
+			lines.push(`  ${DIM}(未配置任何厂商凭证, 将回退环境变量/auth.json)${RESET}`);
 		}
 		for (const [pid, creds] of Object.entries(providers)) {
 			lines.push(`  ${pid}:`);
 			const bp = getBalanceProvider(pid);
 			for (const field of bp?.fields ?? []) {
 				const v = creds[field.key];
-				if (v !== undefined) lines.push(`    ${field.label}: ${maskValue(field, v)}`);
+				if (v !== undefined) lines.push(`    ${kv(field.label, maskValue(field, v), 14)}`);
 			}
 		}
-		ctx.ui.notify(lines.join("\n"), "info");
+		ctx.ui.notify(box(lines).join("\n"), "info");
 	}
 }
 
@@ -280,37 +281,36 @@ function formatUsageText(
 ): string[] {
 	const { total, lastTurn, messageCount } = stats;
 	const cost = calculateCost(adapter, modelId, total);
-	const lines: string[] = [`━━━ 当前会话 API 用量 (${adapter.name}) ━━━`];
-	lines.push(`  模型:         ${modelId ?? "未知"}`);
-	lines.push(`  消息轮次:     ${messageCount}`);
-	lines.push(`  ⬆️ 输入 Token: ${fmtTokens(total.input)}`);
-	lines.push(`  ⬇️ 输出 Token: ${fmtTokens(total.output)}`);
-	lines.push(`  R 缓存命中:   ${fmtTokens(total.cacheRead)}`);
-	lines.push(`  CH 缓存命中率: ${hitRate(total.input, total.cacheRead)}%`);
+	const lines: string[] = [sectionTitle(`当前会话用量 · ${adapter.name}`), ""];
+	lines.push(`  ${kv("模型", modelId ?? "未知", 12)}`);
+	lines.push(`  ${kv("消息轮次", String(messageCount), 12)}`);
+	lines.push(`  ${kv("输入", fmtTokens(total.input), 12)}`);
+	lines.push(`  ${kv("输出", fmtTokens(total.output), 12)}`);
+	lines.push(`  ${kv("缓存命中", fmtTokens(total.cacheRead), 12)}`);
+	lines.push(`  ${kv("缓存命中率", `${hitRate(total.input, total.cacheRead)}%`, 12)}`);
 
 	if (lastTurn) {
 		const turnCost = calculateCost(adapter, modelId, lastTurn);
-		lines.push(`  ⚡ 最近一次回答: ${fmtCurrency(turnCost.totalCNY, turnCost.free)}`);
+		lines.push(`  ${kv("最近一次回答", fmtCurrency(turnCost.totalCNY, turnCost.free))}`);
 	}
 
 	if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价") {
-		lines.push(`  📊 当前计价:   ${cost.variantLabel}${cost.variantNote ? ` (${cost.variantNote})` : ""}`);
+		lines.push(`  ${kv("当前计价", `${cost.variantLabel}${cost.variantNote ? ` (${cost.variantNote})` : ""}`)}`);
 	}
 
 	lines.push("");
-	lines.push("  ── 费用明细 ──");
-	lines.push(`  输入 (缓存未命中): ${fmtCurrency(cost.inputMissCost, cost.free)}`);
-	lines.push(`  输入 (缓存命中):   ${fmtCurrency(cost.inputHitCost, cost.free)}`);
-	lines.push(`  输出:             ${fmtCurrency(cost.outputCost, cost.free)}`);
-	lines.push(`  ───────────────────`);
-	lines.push(`  总计:             ${fmtCurrency(cost.totalCNY, cost.free)}`);
+	lines.push(`  ${subTitle("费用明细")}`);
+	lines.push(`  ${kv("输入 (未命中)", fmtCurrency(cost.inputMissCost, cost.free))}`);
+	lines.push(`  ${kv("输入 (命中)", fmtCurrency(cost.inputHitCost, cost.free))}`);
+	lines.push(`  ${kv("输出", fmtCurrency(cost.outputCost, cost.free))}`);
+	lines.push(`  ${kv("总计", fmtCurrency(cost.totalCNY, cost.free))}`);
 
 	if (adapter.cacheNote) {
 		lines.push("");
-		lines.push(`  ℹ️ 缓存: ${adapter.cacheNote}`);
+		lines.push(...noteWrap(`ℹ️ 缓存: ${adapter.cacheNote}`, "  ", "     "));
 	}
 	if (adapter.billingNote) {
-		lines.push(`  ℹ️ 计费: ${adapter.billingNote}`);
+		lines.push(...noteWrap(`ℹ️ 计费: ${adapter.billingNote}`, "  ", "     "));
 	}
 	return lines;
 }
@@ -320,7 +320,7 @@ function formatUsageText(
 // ═══════════════════════════════════════════
 
 function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined): string[] {
-	const lines: string[] = [`━━━ ${adapter.name} 计价状态 ━━━`];
+	const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name}`), ""];
 	const pricing = modelId
 		? Object.entries(adapter.pricing).sort((a, b) => b[0].length - a[0].length).find(([k]) => modelId.toLowerCase().includes(k))?.[1]
 		: adapter.fallbackPricing;
@@ -335,13 +335,14 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 	const now = new Date();
 	const tier = pricing.tiers[0];
 	if (!tier) return lines;
-	lines.push(`  当前模型: ${modelId ?? "未知"}`);
+	lines.push(`  ${kv("当前模型", modelId ?? "未知", 10)}`);
 	lines.push("");
 	for (const v of tier.variants) {
 		const active = v.active ? v.active(now) : !!v.default;
-		const mark = active ? "● 生效中" : "○";
-		lines.push(`  ${mark} ${v.label}: 命中 ¥${v.prices.inputCacheHit} / 未命中 ¥${v.prices.inputCacheMiss} / 输出 ¥${v.prices.output}`);
-		if (v.note) lines.push(`      ${v.note}`);
+		const mark = active ? "●" : "○";
+		lines.push(`  ${mark} ${v.label}${active ? " (生效中)" : ""}`);
+		lines.push(`    ${kv("命中", `¥${v.prices.inputCacheHit}`, 8)}  ${kv("未命中", `¥${v.prices.inputCacheMiss}`, 8)}  ${kv("输出", `¥${v.prices.output}`, 8)}`);
+		if (v.note) lines.push(`    ${DIM}${v.note}${RESET}`);
 	}
 	if (!adapter.hasPeakPricing) {
 		lines.push("");
@@ -615,7 +616,6 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const chRate = parseFloat(hitRate(total.input, total.cacheRead));
 				const CH_GREEN = 90;
 				const CH_PURPLE = 95;
-				const PURPLE_ANSI = "\x1b[38;5;141m";
 				const chText = `CH${chRate}%`;
 				const chStyled = chRate >= CH_PURPLE
 					? `${PURPLE_ANSI}${chText}\x1b[0m`
@@ -756,7 +756,6 @@ function formatGitSegment(theme: Parameters<typeof balanceSegment>[0]): string |
 export default function (pi: ExtensionAPI) {
 	piRef = pi;
 	let statusEnabled = false;
-	let footerEnabled = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
 	const handler = async (args: string, ctx: ExtensionContext) => {
@@ -767,7 +766,7 @@ export default function (pi: ExtensionAPI) {
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
-			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
+			ctx.ui.notify(box(formatVariantStatus(adapter, modelId)).join("\n"), "info");
 			return;
 		}
 
@@ -828,7 +827,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (balance && isBalance(balance)) {
-				ctx.ui.notify(formatBalanceText(adapter, balance).join("\n"), "info");
+				ctx.ui.notify(box(formatBalanceText(adapter, balance)).join("\n"), "info");
 			}
 			return;
 		}
@@ -842,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 		// ── /usage session ──
 		if (cmd === "session") {
 			const stats = getSessionUsage(ctx);
-			ctx.ui.notify(formatUsageText(adapter, stats, modelId).join("\n"), "info");
+			ctx.ui.notify(box(formatUsageText(adapter, stats, modelId)).join("\n"), "info");
 			return;
 		}
 
@@ -854,10 +853,10 @@ export default function (pi: ExtensionAPI) {
 			if (balance && "error" in balance) {
 				lines.push(`⚠️  ${balance.error}`);
 			} else if (balance && isBalance(balance)) {
-				lines.push(...formatBalanceText(adapter, balance));
+				lines.push(...box(formatBalanceText(adapter, balance)));
 			}
 			lines.push("");
-			lines.push(...formatUsageText(adapter, stats, modelId));
+			lines.push(...box(formatUsageText(adapter, stats, modelId)));
 			ctx.ui.notify(lines.join("\n"), "info");
 			return;
 		}
