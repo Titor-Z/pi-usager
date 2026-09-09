@@ -35,6 +35,7 @@ import {
 import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes, getFooterLayout, setFooterLayout,
+	getBalanceColorThresholds, setBalanceColorThresholds,
 	type BalanceProviderConfig,
 } from "../src/config.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
@@ -196,6 +197,8 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		const lines: string[] = ["━━━ 使用量配置 ━━━"];
 		lines.push(`  余额校准间隔: ${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`);
 		lines.push(`  HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`);
+		const bc = getBalanceColorThresholds();
+		lines.push(`  余额颜色: 提醒线 ¥${bc.yellow.toFixed(2)} (黄) / 告急线 ¥${bc.red.toFixed(2)} (红) / 其余绿`);
 		const providers = config.providers ?? {};
 		if (Object.keys(providers).length === 0) {
 			lines.push("  (未配置任何厂商凭证, 将回退环境变量/auth.json)");
@@ -448,7 +451,11 @@ function balanceSegment(
 	if (!b.available) return theme.fg("error", "⚠️欠费"); // 缓存中的欠费判定 (校准 available=false), 重启后不丢失
 	const total = parseFloat(b.total);
 	const text = `💰¥${total.toFixed(2)}`;
-	return total < 0 ? theme.fg("error", text) : theme.fg("dim", text);
+	// 透支预警不变红; 分档色: < 告急线红 (告急) → < 提醒线黄 (提醒) → 否则绿 (充裕)
+	if (total < 0) return theme.fg("error", text);
+	const { yellow, red } = getBalanceColorThresholds();
+	const color = total < red ? "error" : total < yellow ? "warning" : "success";
+	return theme.fg(color, text);
 }
 
 // ═════════════════════════════════════════
@@ -711,15 +718,39 @@ export default function (pi: ExtensionAPI) {
 			}
 			const current = footerEnabled ? "开" : "关";
 			const layout = getFooterLayout();
+			const thresholds = getBalanceColorThresholds();
 			const action = await ctx.ui.select("HUD 显示设置", [
 				`状态栏: ${current}`,
 				`布局: ${layout === "dual" ? "双行" : "单行"}`,
+				`余额颜色: 提醒线 ¥${thresholds.yellow.toFixed(2)} / 告急线 ¥${thresholds.red.toFixed(2)}`,
 			]);
 			if (!action) return;
 			if (action.startsWith("状态栏")) {
 				footerEnabled = !footerEnabled;
 				if (footerEnabled) enableFooter(ctx);
 				else disableFooter(ctx);
+				return;
+			}
+			if (action.startsWith("余额颜色")) {
+				// 二级输入: 提醒线 (黄) / 告急线 (红), 直接回车跳过不改
+				const yellowStr = await ctx.ui.input(`余额提醒线 (黄色, 当前 ¥${thresholds.yellow.toFixed(2)})`, thresholds.yellow.toFixed(2));
+				const yellow = yellowStr === undefined || yellowStr === "" ? thresholds.yellow : parseFloat(yellowStr);
+				if (Number.isNaN(yellow) || yellow < 0) {
+					ctx.ui.notify("提醒线无效, 未保存", "warning");
+					return;
+				}
+				const redStr = await ctx.ui.input(`余额告急线 (红色, 当前 ¥${thresholds.red.toFixed(2)})`, thresholds.red.toFixed(2));
+				const red = redStr === undefined || redStr === "" ? thresholds.red : parseFloat(redStr);
+				if (Number.isNaN(red) || red < 0) {
+					ctx.ui.notify("告急线无效, 未保存", "warning");
+					return;
+				}
+				// 红线应低于黄线: 倒置时交换并提示
+				let [y, r] = yellow >= red ? [yellow, red] : [red, yellow];
+				if (y !== yellow) ctx.ui.notify("两条线大小倒置, 已自动交换", "info");
+				setBalanceColorThresholds(y, r);
+				ctx.ui.notify(`余额颜色已更新: 提醒线 ¥${y.toFixed(2)} / 告急线 ¥${r.toFixed(2)}`, "info");
+				requestFooterRender();
 				return;
 			}
 			// 布局选择

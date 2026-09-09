@@ -34,6 +34,8 @@ export interface BalanceConfig {
 	balanceCache?: Record<string, CachedBalance>;
 	/** HUD footer 布局: dual = 双行 (原生风格, 余额在首行右侧); single = 单行紧凑; 默认 dual */
 	footerLayout?: "dual" | "single";
+	/** 余额分档色阈值: yellow = 提醒线 (低于变黄), red = 告急线 (低于变红); 默认 1.0 / 0.5 */
+	balanceColors?: { yellow: number; red: number };
 }
 
 export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
@@ -91,5 +93,23 @@ export function getFooterLayout(): "dual" | "single" {
 export function setFooterLayout(layout: "dual" | "single"): void {
 	const config = loadConfig();
 	config.footerLayout = layout;
+	saveConfig(config);
+}
+
+/**
+ * 余额分档色阈值 (读取时规范化: 若用户填成 red ≥ yellow, 交换保证区间单调)。
+ * 语义: 余额 < red 显示红 (告急), < yellow 显示黄 (提醒), 否则绿 (充裕)。
+ */
+export function getBalanceColorThresholds(): { yellow: number; red: number } {
+	const c = loadConfig().balanceColors;
+	let yellow = c?.yellow ?? 1.0;
+	let red = c?.red ?? 0.5;
+	if (red >= yellow) [yellow, red] = [red, yellow];
+	return { yellow, red };
+}
+
+export function setBalanceColorThresholds(yellow: number, red: number): void {
+	const config = loadConfig();
+	config.balanceColors = { yellow, red };
 	saveConfig(config);
 }
