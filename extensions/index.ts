@@ -307,10 +307,12 @@ function formatUsageText(
 
 	if (adapter.cacheNote) {
 		lines.push("");
-		lines.push(...noteWrap(`ℹ️ 缓存: ${adapter.cacheNote}`, "  ", "     "));
+		lines.push("  ℹ️ 缓存:");
+		lines.push(...noteWrap(adapter.cacheNote, "    ", "    "));
 	}
 	if (adapter.billingNote) {
-		lines.push(...noteWrap(`ℹ️ 计费: ${adapter.billingNote}`, "  ", "     "));
+		lines.push("  ℹ️ 计费:");
+		lines.push(...noteWrap(adapter.billingNote, "    ", "    "));
 	}
 	return lines;
 }
