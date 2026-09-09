@@ -65,6 +65,34 @@ export interface ModelPricing {
 	cacheStorageNote?: string;
 }
 
+/** 自定义计价的时段规则 (闹钟式: 生效日 + 小时区间) */
+export interface PricingPeriod {
+	/** 时段名称, 如 "高峰" / "低谷" */
+	label: string;
+	/** 该时段单价 (¥/百万 tokens) */
+	prices: UnitPrices;
+	/** 生效日: 0~6 (0=周日); 缺省 = 每天 */
+	days?: number[];
+	/** 起始小时 (含), 0~23 */
+	startHour: number;
+	/** 结束小时 (不含), 0~23; endHour <= startHour 视为跨午夜 (如 22~6) */
+	endHour: number;
+}
+
+/** 用户自定义计价规则 (优先级高于内置定价, 完全接管该模型) */
+export interface CustomPricing {
+	/** 厂商 id (glm / deepseek) */
+	providerId: string;
+	/** 模型模糊匹配串: modelId.includes(pattern), 不区分大小写 */
+	pattern: string;
+	/** 基础单价 (¥/百万 tokens), 未命中任何时段时使用 (平时价) */
+	base: UnitPrices;
+	/** 时段表 (峰谷/活动价), 缺省 = 恒用 base */
+	periods?: PricingPeriod[];
+	/** 备注, 如 "9/10 官方新价" */
+	note?: string;
+}
+
 /** 账户余额 (统一结构) */
 export interface ProviderBalance {
 	available: boolean;

@@ -26,7 +26,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { resolveProvider, ADAPTERS } from "../src/index.ts";
 import { isPeakHour } from "../src/deepseek.ts";
-import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "../src/cost.ts";
+import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate, lookupPricing, setCustomPricing, periodActive } from "../src/cost.ts";
 import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
 import {
 	getDisplayedBalance, addSpend, calibrate, isDepleted, markDepleted, clearDepleted, needsCalibrate,
@@ -35,9 +35,10 @@ import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes, getFooterLayout, setFooterLayout,
 	getBalanceColorThresholds, setBalanceColorThresholds,
+	getCustomPricing, addCustomPricing, removeCustomPricing,
 	type BalanceProviderConfig,
 } from "../src/config.ts";
-import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
+import type { ProviderAdapter, ProviderBalance, BalanceResult, CustomPricing, UnitPrices } from "../src/types.ts";
 import { sectionTitle, subTitle, kv, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
 
 // ═══════════════════════════════════════════
@@ -104,6 +105,26 @@ function autoRecommendReason(
 //  交互式配置 (/usage config)
 // ═══════════════════════════════════════════
 
+/** 三价录入助手 (¥/M): 空输入沿用 prefill, 取消 (Esc) 返回 undefined; 非法值提示并返回 undefined */
+async function inputPrices(ctx: ExtensionContext, title: string, prefill: UnitPrices): Promise<UnitPrices | undefined> {
+	const hit = await ctx.ui.input(`${title} · 缓存命中价 (¥/M)`, String(prefill.inputCacheHit));
+	if (hit === undefined) return undefined;
+	const miss = await ctx.ui.input(`${title} · 未命中价 (¥/M)`, String(prefill.inputCacheMiss));
+	if (miss === undefined) return undefined;
+	const out = await ctx.ui.input(`${title} · 输出价 (¥/M)`, String(prefill.output));
+	if (out === undefined) return undefined;
+	const p = {
+		inputCacheHit: hit === "" ? prefill.inputCacheHit : parseFloat(hit),
+		inputCacheMiss: miss === "" ? prefill.inputCacheMiss : parseFloat(miss),
+		output: out === "" ? prefill.output : parseFloat(out),
+	};
+	if (Object.values(p).some((v) => Number.isNaN(v) || v < 0)) {
+		ctx.ui.notify("单价无效 (需为 ≥0 的数字)", "warning");
+		return undefined;
+	}
+	return p;
+}
+
 async function configFlow(ctx: ExtensionContext): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("当前环境无 TUI，无法交互式配置；请手动编辑 ~/.pi/pi-usager.json", "warning");
@@ -114,6 +135,7 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		[
 			"配置厂商凭证",
 			"余额校准间隔",
+			"自定义计价",
 			`HUD 状态栏: ${footerEnabled ? "开" : "关"}`,
 			`HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`,
 			`余额颜色: 提醒线 ¥${getBalanceColorThresholds().yellow.toFixed(2)} / 告急线 ¥${getBalanceColorThresholds().red.toFixed(2)}`,
@@ -180,6 +202,61 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		}
 		setRefreshMinutes(n);
 		ctx.ui.notify(`余额校准间隔已设为 ${n} 分钟（下次会话生效）`, "info");
+		return;
+	}
+
+	// ── 自定义计价 (闹钟式向导) ──
+	if (action === "自定义计价") {
+		const providerId = await ctx.ui.select("哪个厂商的自定义计价?", Object.keys(BALANCE_PROVIDERS));
+		if (!providerId) return;
+		const pAdapter = adapterById(providerId)!;
+		const rules = getCustomPricing(providerId);
+		if (rules.length > 0) {
+			ctx.ui.notify(rules.map((r, i) => `${i + 1}. ${r.pattern} (基础 ¥${r.base.inputCacheMiss}/${r.base.output} 每M${r.periods?.length ? ` + ${r.periods.length} 个时段` : ""})`).join("\n"), "info");
+		}
+		const op = await ctx.ui.select("自定义计价", ["新增规则", ...(rules.length > 0 ? ["删除规则"] : [])]);
+		if (!op) return;
+		if (op === "删除规则") {
+			const pick = await ctx.ui.select("删除哪条规则?", rules.map((r, i) => `${i + 1}. ${r.pattern}`));
+			if (pick === undefined) return;
+			const n = parseInt(pick, 10) - 1;
+			if (await ctx.ui.confirm("确认删除?", `将删除 ${rules[n].pattern} 的自定义计价`)) {
+				removeCustomPricing(providerId, n);
+				setCustomPricing(getCustomPricing());
+				ctx.ui.notify("自定义计价已删除", "info");
+				requestFooterRender();
+			}
+			return;
+		}
+		// 新增向导
+		const pattern = await ctx.ui.input("模型匹配串 (modelId 包含即命中)", ctx.model?.id ?? "glm-5.3-flash");
+		if (!pattern || !pattern.trim()) return;
+		// 内置价作预填参考
+		const bp = lookupPricing(pAdapter, pattern.trim());
+		const tier0 = bp?.tiers?.[0];
+		const prefillBuiltin = tier0?.variants?.[0]?.prices ?? { inputCacheHit: 0, inputCacheMiss: 0, output: 0 };
+		const base = await inputPrices(ctx, "基础单价 (平时价, 未命中时段时使用)", prefillBuiltin);
+		if (!base) return;
+		const periods: import("../src/types.ts").PricingPeriod[] = [];
+		while (await ctx.ui.confirm("添加时段?", "如高峰/低谷: 生效日 + 小时区间; 未覆盖的时间用基础价")) {
+			const label = (await ctx.ui.input("时段名称 (如 高峰/低谷)", "高峰"))?.trim() || `时段${periods.length + 1}`;
+			const p = await inputPrices(ctx, `「${label}」时段单价`, base);
+			if (!p) break;
+			const dayPick = await ctx.ui.select("生效日", ["每天", "周一至周五", "周六日"]);
+			if (dayPick === undefined) break;
+			const days = dayPick === "每天" ? undefined : dayPick === "周一至周五" ? [1, 2, 3, 4, 5] : [0, 6];
+			const sh = parseInt((await ctx.ui.input("起始小时 (0~23, 含)", dayPick === "周一至周五" ? "9" : "22")) ?? "", 10);
+			const eh = parseInt((await ctx.ui.input("结束小时 (0~23, 不含; 小于起始小时则跨午夜)", dayPick === "周一至周五" ? "12" : "6")) ?? "", 10);
+			if (Number.isNaN(sh) || Number.isNaN(eh) || sh < 0 || sh > 23 || eh < 0 || eh > 23 || sh === eh) {
+				ctx.ui.notify("小时无效, 该时段未添加", "warning");
+				continue;
+			}
+			periods.push({ label, prices: p, days, startHour: sh, endHour: eh });
+		}
+		addCustomPricing({ providerId, pattern: pattern.trim(), base, periods: periods.length > 0 ? periods : undefined });
+		setCustomPricing(getCustomPricing());
+		ctx.ui.notify(`自定义计价已保存并生效 (${periods.length} 个时段)`, "info");
+		requestFooterRender();
 		return;
 	}
 
@@ -321,7 +398,27 @@ function formatUsageText(
 //  计价变体状态 (/usage peak)
 // ═══════════════════════════════════════════
 
-function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined): string[] {
+function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined, customRules: CustomPricing[] = []): string[] {
+	// 自定义规则命中时优先展示时段表
+	const cr = customRules.find(
+		(r) => modelId !== undefined && modelId.toLowerCase().includes(r.pattern.toLowerCase()),
+	);
+	if (cr) {
+		const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name} (自定义)`), ""];
+		lines.push(`  ${kv("匹配模型", cr.pattern, 10)}`);
+		lines.push("");
+		lines.push(`  ${subTitle("时段表 (未覆盖时间用基础价)")}`);
+		lines.push(`    ${kv("基础价", `命中 ¥${cr.base.inputCacheHit} / 未命中 ¥${cr.base.inputCacheMiss} / 输出 ¥${cr.base.output}`, 10)}`);
+		const dayText = (d?: number[]) => d === undefined ? "每天" : d.length === 5 && d.every((x, i) => x === i + 1) ? "周一至五" : d.length === 2 && d.includes(0) && d.includes(6) ? "周六日" : d.join(",");
+		const now = new Date();
+		for (const p of cr.periods ?? []) {
+			const active = periodActive(p, now);
+			lines.push(`  ${active ? "●" : "○"} ${p.label}${active ? " (生效中)" : ""}: ${dayText(p.days)} ${p.startHour}~${p.endHour} 点`);
+			lines.push(`      ${kv("命中", `¥${p.prices.inputCacheHit}`, 8)}  ${kv("未命中", `¥${p.prices.inputCacheMiss}`, 8)}  ${kv("输出", `¥${p.prices.output}`, 8)}`);
+		}
+		if (cr.note) lines.push(`    ${DIM}${cr.note}${RESET}`);
+		return lines;
+	}
 	const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name}`), ""];
 	const pricing = modelId
 		? Object.entries(adapter.pricing).sort((a, b) => b[0].length - a[0].length).find(([k]) => modelId.toLowerCase().includes(k))?.[1]
@@ -757,6 +854,7 @@ function formatGitSegment(theme: Parameters<typeof balanceSegment>[0]): string |
 
 export default function (pi: ExtensionAPI) {
 	piRef = pi;
+	setCustomPricing(getCustomPricing()); // 加载用户自定义计价规则
 	let statusEnabled = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -768,7 +866,7 @@ export default function (pi: ExtensionAPI) {
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
-			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
+			ctx.ui.notify(formatVariantStatus(adapter, modelId, getCustomPricing(adapter.id)).join("\n"), "info");
 			return;
 		}
 

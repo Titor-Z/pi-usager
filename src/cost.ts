@@ -3,7 +3,7 @@
  * 所有费用单位为人民币 ¥
  */
 
-import type { ProviderAdapter, ModelPricing, PriceVariant, UnitPrices, Usage, CostBreakdown, PriceTier } from "./types.ts";
+import type { ProviderAdapter, ModelPricing, PriceVariant, UnitPrices, Usage, CostBreakdown, PriceTier, CustomPricing } from "./types.ts";
 
 // ═══════════════════════════════════════════
 //  定价解析
@@ -44,6 +44,39 @@ export interface ResolvedPricing {
 	variantNote?: string;
 	/** 是否命中了非兜底阶梯 (跨档提示用) */
 	tierMatched: boolean;
+}
+
+// ═════════════════════════════════════════
+//  自定义计价 (用户规则, 优先级高于内置定价)
+// ═════════════════════════════════════════
+
+let customRules: CustomPricing[] = [];
+
+/** 由扩展在启动时与配置变更后注入 (单进程内存注册表) */
+export function setCustomPricing(rules: CustomPricing[]): void {
+	customRules = rules;
+}
+
+/** 时段是否在当前时刻生效 (支持跨午夜: endHour <= startHour) */
+export function periodActive(p: { days?: number[]; startHour: number; endHour: number }, now: Date): boolean {
+	if (p.days && !p.days.includes(now.getDay())) return false;
+	const h = now.getHours();
+	return p.endHour > p.startHour
+		? h >= p.startHour && h < p.endHour
+		: h >= p.startHour || h < p.endHour;
+}
+
+/** 自定义规则求值: 声明序首个 pattern 命中 → 时段轮询 → 未命中时段用 base */
+export function resolveCustomPricing(rules: CustomPricing[], providerId: string, modelId: string | undefined, now: Date): ResolvedPricing | undefined {
+	const rule = rules.find(
+		(r) => r.providerId === providerId && modelId !== undefined && modelId.toLowerCase().includes(r.pattern.toLowerCase()),
+	);
+	if (!rule) return undefined;
+	const period = rule.periods?.find((p) => periodActive(p, now));
+	if (period) {
+		return { prices: period.prices, free: false, variantLabel: period.label, variantNote: rule.note, tierMatched: true };
+	}
+	return { prices: rule.base, free: false, variantLabel: "自定义计价", variantNote: rule.note, tierMatched: true };
 }
 
 /** 完整解析: 免费模型 → 阶梯匹配 → 变体选择 */
@@ -89,6 +122,23 @@ export function calculateCost(
 	usage: Usage,
 	now = new Date(),
 ): CostBreakdown {
+	// 自定义计价优先: 用户规则完全接管命中模型 (含免费判定)
+	const custom = resolveCustomPricing(customRules, adapter.id, modelId, now);
+	if (custom) {
+		const p = custom.prices;
+		const inputMissCost = (usage.input / 1_000_000) * p.inputCacheMiss;
+		const inputHitCost = (usage.cacheRead / 1_000_000) * p.inputCacheHit;
+		const outputCost = (usage.output / 1_000_000) * p.output;
+		return {
+			inputMissCost,
+			inputHitCost,
+			outputCost,
+			totalCNY: inputMissCost + inputHitCost + outputCost,
+			free: false,
+			variantLabel: custom.variantLabel,
+			variantNote: custom.variantNote,
+		};
+	}
 	const pricing = lookupPricing(adapter, modelId);
 	if (!pricing) {
 		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false };
