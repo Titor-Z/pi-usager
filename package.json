@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-usager",
-	"version": "2.0.0",
+	"version": "2.1.0",
 	"description": "为 Pi Agent 打造的特权额度 HUD — 实时掌握 GLM/DeepSeek 用量、费用与余额 | A privileged usage HUD for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek)",
 	"keywords": [
 		"pi-package",
@@ -31,12 +31,16 @@
 			"./extensions/index.ts"
 		]
 	},
-	"dependencies": {
-		"@foolsecret/pi-pricer": "^0.12.0"
-	},
+	"dependencies": {},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-tui": "*",
+		"@foolsecret/pi-pricer": "^0.12.0"
+	},
+	"peerDependenciesMeta": {
+		"@foolsecret/pi-pricer": {
+			"optional": true
+		}
 	},
 	"devDependencies": {
 		"@types/node": "^22.20.2",

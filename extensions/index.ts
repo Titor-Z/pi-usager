@@ -64,6 +64,8 @@ function describePricingSource(source: PricingSource, reason?: string): string {
 	switch (source) {
 		case "pi-pricer":
 			return "pi-pricer 共享价表（~/.pi/model-pricing.json）";
+		case "defaults":
+			return "pi-pricer 内置默认价（未检测到你的自定义配置，请用 /price 核对）";
 		case "failed":
 			return `不可用（pi-pricer 解析失败：${reason ?? "未知原因"}）`;
 		case "missing":
@@ -307,7 +309,8 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		lines.push(`  ${kv("余额颜色", `提醒线 ¥${bc.yellow.toFixed(2)} / 告急线 ¥${bc.red.toFixed(2)}`)}`);
 		const priceSrc = getPricingSource();
 		lines.push(`  ${kv("价格来源", describePricingSource(priceSrc.source, priceSrc.reason))}`);
-		if (priceSrc.source !== "pi-pricer") {
+		// 仅未装/解析失败时提示安装; defaults 态包装了, 不提示
+		if (priceSrc.source === "missing" || priceSrc.source === "failed") {
 			lines.push(`  ${DIM}    ${PRICER_INSTALL_HINT}${RESET}`);
 		}
 		const providers = config.providers ?? {};
@@ -1055,13 +1058,21 @@ export default function (pi: ExtensionAPI) {
 		// 启动即显示持久化缓存; 异步校准纠偏 (两会话间充了值会闪 ▲)
 		const adapter = resolveProvider(ctx.model?.id);
 		if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
-		// 共享价表不可用提示 (每会话一次; 未装先保证预热已完成再判态)
-		if (pricerHintShown) return;
+		// 预热共享价表 (供后续 turn 判定与 footer 展示)
 		await ensurePricingSource();
-		const { source, reason } = getPricingSource();
+	});
+
+	// 共享价表提示延后到首个 turn: session_start 阶段 TUI 可能尚未就绪,
+	// 此时的 ctx.ui.notify 会被静默丢弃 (没看到安装提示的成因之一)。
+	pi.on("turn_start", (_event, ctx) => {
+		if (pricerHintShown) return;
 		pricerHintShown = true;
+		const { source, reason } = getPricingSource();
 		switch (source) {
 			case "pi-pricer":
+				return;
+			case "defaults":
+				ctx.ui.notify("pi-usager 当前用的是 pi-pricer 内置默认价 —— 未检测到你的自定义配置。装好 @foolsecret/pi-pricer 后用 /price 核对价格。", "info");
 				return;
 			case "failed":
 				ctx.ui.notify(`pi-pricer 价格解析失败（${reason ?? "未知原因"}），费用无法估算。请检查 ~/.pi/model-pricing.json。`, "warning");

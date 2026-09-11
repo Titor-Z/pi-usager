@@ -2,8 +2,9 @@
  * 共享价表接入测试 (node:test + jiti 直载 TS)
  *
  * 运行: node --test
- * 覆盖: 三态 (pi-pricer / missing / failed)、ResolvedPrice → 费用换算、
- *       免费判定、价表不可用时不算出误导性金额、峰谷 isPeak 透传。
+ * 覆盖: 四态 (pi-pricer / defaults / missing / failed)、ResolvedPrice → 费用换算、
+ *       免费判定、价表不可用时不算出误导性金额、峰谷 isPeak 透传、
+ *       内置默认价与用户价表的区分 (本次事故核心)。
  * 真实 pi-pricer 集成用例在未安装时自动 skip (CI/他人机器友好)。
  */
 
@@ -90,8 +91,6 @@ test("未选模型: 不报错, 返回未知价", () => {
 });
 
 test("真实 pi-pricer: 临时价表驱动费用 (未安装则 skip)", async (t) => {
-	// 用 jiti 加载 —— pi 运行时正是经 jiti 加载扩展, 而 Node 原生 import 无法
-	// 剥离 node_modules 下的 .ts (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING)
 	let createPricer = null;
 	try {
 		const mod = await jiti.import("@foolsecret/pi-pricer/pricing");
@@ -122,6 +121,63 @@ test("真实 pi-pricer: 临时价表驱动费用 (未安装则 skip)", async (t)
 		assert.equal(source.getPricingSource().source, "pi-pricer");
 		const r = cost.calculateCost(adapter, "deepseek-flash", usage);
 		assert.ok(Math.abs(r.totalCNY - 31) < 1e-9, `期望 31 (10+1+20), 实际 ${r.totalCNY}`);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		source.resetPricingSource();
+	}
+});
+
+// ── 内置默认价 vs 用户价表（本次事故核心） ───────────────────────────
+
+test("defaults 态: 价表文件缺失 -> defaults（pi-pricer 静默回退内置默认价）", async (t) => {
+	try {
+		await jiti.import("@foolsecret/pi-pricer/pricing");
+	} catch {
+		t.skip("pi-pricer 不可用，跳过 defaults 用例");
+		return;
+	}
+	const { mkdtempSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	// 临时目录下不存在 model-pricing.json —— 即"从未配置过"
+	const dir = mkdtempSync(join(tmpdir(), "pi-usager-defaults-"));
+	try {
+		source.resetPricingSource();
+		await source.ensurePricingSource(undefined, join(dir, "model-pricing.json"));
+		assert.equal(source.getPricingSource().source, "defaults");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		source.resetPricingSource();
+	}
+});
+
+test("defaults 态: 用户自定义价表 -> pi-pricer（不误判为 defaults）", async (t) => {
+	let createPricer = null;
+	try {
+		createPricer = (await jiti.import("@foolsecret/pi-pricer/pricing")).createPricingResolver ?? null;
+	} catch {
+		t.skip("pi-pricer 不可用，跳过用例");
+		return;
+	}
+	if (!createPricer) {
+		t.skip("pi-pricer 不可用，跳过用例");
+		return;
+	}
+	const { writeFileSync, mkdtempSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const dir = mkdtempSync(join(tmpdir(), "pi-usager-custom-"));
+	const pricingPath = join(dir, "model-pricing.json");
+	writeFileSync(pricingPath, JSON.stringify({
+		version: 2, calendars: {},
+		prices: { mine: { name: "我的价", input: { miss: 42, hit: 4 }, output: 84 } },
+		plans: { mine: { name: "我的方案", rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: "mine" }] } },
+		providers: { deepseek: { models: { "deepseek-flash": { plans: [{ plan: "mine", enabled: true }] } } } },
+	}), "utf8");
+	try {
+		source.resetPricingSource();
+		await source.ensurePricingSource(undefined, pricingPath);
+		assert.equal(source.getPricingSource().source, "pi-pricer");
+		const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+		assert.ok(Math.abs(r.totalCNY - 130) < 1e-9, `期望 130 (42+4+84), 实际 ${r.totalCNY}`);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 		source.resetPricingSource();
