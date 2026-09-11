@@ -8,7 +8,6 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { CustomPricing } from "./types.ts";
 
 export interface BalanceProviderConfig {
 	/** 字段名 → 值 (凭证等) */
@@ -37,8 +36,6 @@ export interface BalanceConfig {
 	footerLayout?: "dual" | "single";
 	/** 余额分档色阈值: yellow = 提醒线 (低于变黄), red = 告急线 (低于变红); 默认 1.0 / 0.5 */
 	balanceColors?: { yellow: number; red: number };
-	/** 用户自定义计价规则 (优先级高于内置定价, 完全接管命中模型) */
-	customPricing?: CustomPricing[];
 }
 
 export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
@@ -46,7 +43,7 @@ export const CONFIG_PATH = join(homedir(), ".pi/pi-usager.json");
 export function loadConfig(): BalanceConfig {
 	try {
 		if (existsSync(CONFIG_PATH)) {
-			return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+			return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as BalanceConfig;
 		}
 	} catch { /* 损坏时按空配置处理 */ }
 	return { providers: {} };
@@ -115,28 +112,4 @@ export function setBalanceColorThresholds(yellow: number, red: number): void {
 	const config = loadConfig();
 	config.balanceColors = { yellow, red };
 	saveConfig(config);
-}
-
-export function getCustomPricing(providerId?: string): CustomPricing[] {
-	const rules = loadConfig().customPricing ?? [];
-	return providerId ? rules.filter((r) => r.providerId === providerId) : rules;
-}
-
-export function addCustomPricing(rule: CustomPricing): void {
-	const config = loadConfig();
-	config.customPricing = config.customPricing ?? [];
-	config.customPricing.push(rule);
-	saveConfig(config);
-}
-
-/** 按索引删除 (与 getCustomPricing 返回顺序一致); 返回是否删除成功 */
-export function removeCustomPricing(providerId: string, index: number): boolean {
-	const config = loadConfig();
-	const rules = config.customPricing ?? [];
-	const filtered = rules.filter((r) => r.providerId === providerId);
-	const target = filtered[index];
-	if (!target) return false;
-	config.customPricing = rules.filter((r) => r !== target);
-	saveConfig(config);
-	return true;
 }

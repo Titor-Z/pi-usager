@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 AGENTS.md
 *.log
+
+# 本地计划/草稿目录 (ZCode CLI)
+.zcode/

@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-usager",
-	"version": "1.7.0",
+	"version": "2.0.0",
 	"description": "为 Pi Agent 打造的特权额度 HUD — 实时掌握 GLM/DeepSeek 用量、费用与余额 | A privileged usage HUD for Pi Agent — real-time usage & multi-provider balance (GLM + DeepSeek)",
 	"keywords": [
 		"pi-package",
@@ -11,8 +11,17 @@
 		"glm",
 		"deepseek"
 	],
-	"license": "MIT",
+	"license": "AGPL-3.0-only",
 	"author": "Titor-Z",
+	"files": [
+		"extensions",
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node --test --test-force-exit test/*.test.mjs"
+	},
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/Titor-Z/pi-usager.git"
@@ -22,8 +31,15 @@
 			"./extensions/index.ts"
 		]
 	},
+	"dependencies": {
+		"@foolsecret/pi-pricer": "^0.12.0"
+	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.2",
+		"jiti": "^2.7.0"
 	}
 }

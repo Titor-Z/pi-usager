@@ -77,3 +77,7 @@ export function noteWrap(text: string, prefix: string, hangIndent: string): stri
 	out.push(line);
 	return out;
 }
+
+// ═══════════════════════════════════════════
+//  自定义计价描述 (设置列表表单 / 查看配置 / /usage peak 三处共用)
+// ═══════════════════════════════════════════

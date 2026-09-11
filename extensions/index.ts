@@ -25,8 +25,10 @@ import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { resolveProvider, ADAPTERS } from "../src/index.ts";
-import { isPeakHour } from "../src/deepseek.ts";
-import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate, lookupPricing, setCustomPricing, periodActive } from "../src/cost.ts";
+import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "../src/cost.ts";
+import {
+	ensurePricingSource, getPricingSource, resolveDebug, getPricingResolver, type ResolutionStep, type PricingSource,
+} from "../src/pricing-source.ts";
 import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
 import {
 	getDisplayedBalance, addSpend, calibrate, isDepleted, markDepleted, clearDepleted, needsCalibrate,
@@ -35,10 +37,9 @@ import {
 	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes, getFooterLayout, setFooterLayout,
 	getBalanceColorThresholds, setBalanceColorThresholds,
-	getCustomPricing, addCustomPricing, removeCustomPricing,
 	type BalanceProviderConfig,
 } from "../src/config.ts";
-import type { ProviderAdapter, ProviderBalance, BalanceResult, CustomPricing, UnitPrices } from "../src/types.ts";
+import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
 import { sectionTitle, subTitle, kv, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
 
 // ═══════════════════════════════════════════
@@ -48,6 +49,55 @@ import { sectionTitle, subTitle, kv, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI
 const DEBUG = !!process.env.PI_USAGER_DEBUG;
 function debugLog(...args: unknown[]): void {
 	if (DEBUG) console.error("[pi-usager]", ...args);
+}
+
+// ═══════════════════════════════════════════
+//  共享价表 (pi-pricer) 接入辅助
+// ═══════════════════════════════════════════
+
+/** 安装指引 (未装/加载失败时统一文案) */
+const PRICER_INSTALL_HINT =
+	"本插件计费依赖共享价表 @foolsecret/pi-pricer，请安装：pi extension add @foolsecret/pi-pricer";
+
+/** 价格来源人读文案 */
+function describePricingSource(source: PricingSource, reason?: string): string {
+	switch (source) {
+		case "pi-pricer":
+			return "pi-pricer 共享价表（~/.pi/model-pricing.json）";
+		case "failed":
+			return `不可用（pi-pricer 解析失败：${reason ?? "未知原因"}）`;
+		case "missing":
+			return "未安装 pi-pricer（费用无法估算）";
+	}
+}
+
+/**
+ * 峰谷图标判定: 该模型当前命中的规则是否含时间窗 (weekdays/ranges)。
+ * pi-pricer 的 schedule 是用户自配的, 不假设"峰/谷"语义 —— 命中时间窗规则
+ * 就显示 🕸️ (时段价)，命中全时兑底规则就显示 🦦 (平时价)。
+ * 返回 null = 无法判定 (价表不可用/模型未配置) -> 不显示图标。
+ */
+function peakIcon(providerId: string, modelId: string | undefined): string | null {
+	if (!modelId || !getPricingResolver()) return null;
+	const now = new Date();
+	const price = getPricingResolver()!(modelId, providerId, now);
+	return price.isPeak ? "🕸️" : "🦦";
+}
+
+/** 峰谷图标 -> footer 分色段 (dim 色); 无法判定时不显示 */
+function footerSegPeak(
+	theme: { fg(color: string, text: string): string },
+	providerId: string,
+	modelId: string | undefined,
+): string | undefined {
+	const icon = peakIcon(providerId, modelId);
+	return icon ? theme.fg("dim", icon) : undefined;
+}
+
+/** 峰谷图标 -> 状态栏文本后缀 (带前导空格); 无法判定时为空串 */
+function peakStatusSuffix(providerId: string, modelId: string | undefined): string {
+	const icon = peakIcon(providerId, modelId);
+	return icon ? ` ${icon}` : "";
 }
 
 // ═══════════════════════════════════════════
@@ -105,26 +155,6 @@ function autoRecommendReason(
 //  交互式配置 (/usage config)
 // ═══════════════════════════════════════════
 
-/** 三价录入助手 (¥/M): 空输入沿用 prefill, 取消 (Esc) 返回 undefined; 非法值提示并返回 undefined */
-async function inputPrices(ctx: ExtensionContext, title: string, prefill: UnitPrices): Promise<UnitPrices | undefined> {
-	const hit = await ctx.ui.input(`${title} · 缓存命中价 (¥/M)`, String(prefill.inputCacheHit));
-	if (hit === undefined) return undefined;
-	const miss = await ctx.ui.input(`${title} · 未命中价 (¥/M)`, String(prefill.inputCacheMiss));
-	if (miss === undefined) return undefined;
-	const out = await ctx.ui.input(`${title} · 输出价 (¥/M)`, String(prefill.output));
-	if (out === undefined) return undefined;
-	const p = {
-		inputCacheHit: hit === "" ? prefill.inputCacheHit : parseFloat(hit),
-		inputCacheMiss: miss === "" ? prefill.inputCacheMiss : parseFloat(miss),
-		output: out === "" ? prefill.output : parseFloat(out),
-	};
-	if (Object.values(p).some((v) => Number.isNaN(v) || v < 0)) {
-		ctx.ui.notify("单价无效 (需为 ≥0 的数字)", "warning");
-		return undefined;
-	}
-	return p;
-}
-
 async function configFlow(ctx: ExtensionContext): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("当前环境无 TUI，无法交互式配置；请手动编辑 ~/.pi/pi-usager.json", "warning");
@@ -135,7 +165,6 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		[
 			"配置厂商凭证",
 			"余额校准间隔",
-			"自定义计价",
 			`HUD 状态栏: ${footerEnabled ? "开" : "关"}`,
 			`HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`,
 			`余额颜色: 提醒线 ¥${getBalanceColorThresholds().yellow.toFixed(2)} / 告急线 ¥${getBalanceColorThresholds().red.toFixed(2)}`,
@@ -202,61 +231,6 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		}
 		setRefreshMinutes(n);
 		ctx.ui.notify(`余额校准间隔已设为 ${n} 分钟（下次会话生效）`, "info");
-		return;
-	}
-
-	// ── 自定义计价 (闹钟式向导) ──
-	if (action === "自定义计价") {
-		const providerId = await ctx.ui.select("哪个厂商的自定义计价?", Object.keys(BALANCE_PROVIDERS));
-		if (!providerId) return;
-		const pAdapter = adapterById(providerId)!;
-		const rules = getCustomPricing(providerId);
-		if (rules.length > 0) {
-			ctx.ui.notify(rules.map((r, i) => `${i + 1}. ${r.pattern} (基础 ¥${r.base.inputCacheMiss}/${r.base.output} 每M${r.periods?.length ? ` + ${r.periods.length} 个时段` : ""})`).join("\n"), "info");
-		}
-		const op = await ctx.ui.select("自定义计价", ["新增规则", ...(rules.length > 0 ? ["删除规则"] : [])]);
-		if (!op) return;
-		if (op === "删除规则") {
-			const pick = await ctx.ui.select("删除哪条规则?", rules.map((r, i) => `${i + 1}. ${r.pattern}`));
-			if (pick === undefined) return;
-			const n = parseInt(pick, 10) - 1;
-			if (await ctx.ui.confirm("确认删除?", `将删除 ${rules[n].pattern} 的自定义计价`)) {
-				removeCustomPricing(providerId, n);
-				setCustomPricing(getCustomPricing());
-				ctx.ui.notify("自定义计价已删除", "info");
-				requestFooterRender();
-			}
-			return;
-		}
-		// 新增向导
-		const pattern = await ctx.ui.input("模型匹配串 (modelId 包含即命中)", ctx.model?.id ?? "glm-5.3-flash");
-		if (!pattern || !pattern.trim()) return;
-		// 内置价作预填参考
-		const bp = lookupPricing(pAdapter, pattern.trim());
-		const tier0 = bp?.tiers?.[0];
-		const prefillBuiltin = tier0?.variants?.[0]?.prices ?? { inputCacheHit: 0, inputCacheMiss: 0, output: 0 };
-		const base = await inputPrices(ctx, "基础单价 (平时价, 未命中时段时使用)", prefillBuiltin);
-		if (!base) return;
-		const periods: import("../src/types.ts").PricingPeriod[] = [];
-		while (await ctx.ui.confirm("添加时段?", "如高峰/低谷: 生效日 + 小时区间; 未覆盖的时间用基础价")) {
-			const label = (await ctx.ui.input("时段名称 (如 高峰/低谷)", "高峰"))?.trim() || `时段${periods.length + 1}`;
-			const p = await inputPrices(ctx, `「${label}」时段单价`, base);
-			if (!p) break;
-			const dayPick = await ctx.ui.select("生效日", ["每天", "周一至周五", "周六日"]);
-			if (dayPick === undefined) break;
-			const days = dayPick === "每天" ? undefined : dayPick === "周一至周五" ? [1, 2, 3, 4, 5] : [0, 6];
-			const sh = parseInt((await ctx.ui.input("起始小时 (0~23, 含)", dayPick === "周一至周五" ? "9" : "22")) ?? "", 10);
-			const eh = parseInt((await ctx.ui.input("结束小时 (0~23, 不含; 小于起始小时则跨午夜)", dayPick === "周一至周五" ? "12" : "6")) ?? "", 10);
-			if (Number.isNaN(sh) || Number.isNaN(eh) || sh < 0 || sh > 23 || eh < 0 || eh > 23 || sh === eh) {
-				ctx.ui.notify("小时无效, 该时段未添加", "warning");
-				continue;
-			}
-			periods.push({ label, prices: p, days, startHour: sh, endHour: eh });
-		}
-		addCustomPricing({ providerId, pattern: pattern.trim(), base, periods: periods.length > 0 ? periods : undefined });
-		setCustomPricing(getCustomPricing());
-		ctx.ui.notify(`自定义计价已保存并生效 (${periods.length} 个时段)`, "info");
-		requestFooterRender();
 		return;
 	}
 
@@ -331,6 +305,11 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		lines.push(`  ${kv("HUD 布局", getFooterLayout() === "dual" ? "双行" : "单行")}`);
 		const bc = getBalanceColorThresholds();
 		lines.push(`  ${kv("余额颜色", `提醒线 ¥${bc.yellow.toFixed(2)} / 告急线 ¥${bc.red.toFixed(2)}`)}`);
+		const priceSrc = getPricingSource();
+		lines.push(`  ${kv("价格来源", describePricingSource(priceSrc.source, priceSrc.reason))}`);
+		if (priceSrc.source !== "pi-pricer") {
+			lines.push(`  ${DIM}    ${PRICER_INSTALL_HINT}${RESET}`);
+		}
 		const providers = config.providers ?? {};
 		if (Object.keys(providers).length === 0) {
 			lines.push(`  ${DIM}(未配置任何厂商凭证, 将回退环境变量/auth.json)${RESET}`);
@@ -391,6 +370,11 @@ function formatUsageText(
 		lines.push("  ℹ️ 计费:");
 		lines.push(...noteWrap(adapter.billingNote, "    ", "    "));
 	}
+	if (!cost.priceKnown) {
+		lines.push("");
+		lines.push(`  ⚠️ 共享价表不可用，费用无法估算`);
+		lines.push(...noteWrap(PRICER_INSTALL_HINT, "    ", "    "));
+	}
 	return lines;
 }
 
@@ -398,60 +382,36 @@ function formatUsageText(
 //  计价变体状态 (/usage peak)
 // ═══════════════════════════════════════════
 
-function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined, customRules: CustomPricing[] = []): string[] {
-	// 自定义规则命中时优先展示时段表
-	const cr = customRules.find(
-		(r) => modelId !== undefined && modelId.toLowerCase().includes(r.pattern.toLowerCase()),
-	);
-	if (cr) {
-		const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name} (自定义)`), ""];
-		lines.push(`  ${kv("匹配模型", cr.pattern, 10)}`);
-		lines.push("");
-		lines.push(`  ${subTitle("时段表 (未覆盖时间用基础价)")}`);
-		lines.push(`    ${kv("基础价", `命中 ¥${cr.base.inputCacheHit} / 未命中 ¥${cr.base.inputCacheMiss} / 输出 ¥${cr.base.output}`, 10)}`);
-		const dayText = (d?: number[]) => d === undefined ? "每天" : d.length === 5 && d.every((x, i) => x === i + 1) ? "周一至五" : d.length === 2 && d.includes(0) && d.includes(6) ? "周六日" : d.join(",");
-		const now = new Date();
-		for (const p of cr.periods ?? []) {
-			const active = periodActive(p, now);
-			lines.push(`  ${active ? "●" : "○"} ${p.label}${active ? " (生效中)" : ""}: ${dayText(p.days)} ${p.startHour}~${p.endHour} 点`);
-			lines.push(`      ${kv("命中", `¥${p.prices.inputCacheHit}`, 8)}  ${kv("未命中", `¥${p.prices.inputCacheMiss}`, 8)}  ${kv("输出", `¥${p.prices.output}`, 8)}`);
-		}
-		if (cr.note) lines.push(`    ${DIM}${cr.note}${RESET}`);
-		return lines;
+function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined): string[] {
+	if (!modelId) return [sectionTitle(`计价状态 · ${adapter.name}`), "", "  当前无选中模型"];
+	const debug = resolveDebug(modelId, adapter.id, new Date());
+	if (!debug) {
+		return [
+			sectionTitle(`计价状态 · ${adapter.name}`),
+			"",
+			"  共享价表不可用（pi-pricer 未安装或解析失败）",
+			`  ${DIM}${PRICER_INSTALL_HINT}${RESET}`,
+		];
 	}
 	const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name}`), ""];
-	const pricing = modelId
-		? Object.entries(adapter.pricing).sort((a, b) => b[0].length - a[0].length).find(([k]) => modelId.toLowerCase().includes(k))?.[1]
-		: adapter.fallbackPricing;
-	if (!pricing) {
-		lines.push("  当前模型不在定价表中");
-		return lines;
-	}
-	if (pricing.free) {
-		lines.push("  该模型为免费模型 (FREE)");
-		return lines;
-	}
-	const now = new Date();
-	const tier = pricing.tiers[0];
-	if (!tier) return lines;
-	lines.push(`  ${kv("当前模型", modelId ?? "未知", 10)}`);
+	lines.push(`  ${kv("当前模型", modelId, 10)}`);
+	lines.push(`  ${kv("价格来源", "pi-pricer 共享价表")}`);
 	lines.push("");
-	for (const v of tier.variants) {
-		const active = v.active ? v.active(now) : !!v.default;
-		const mark = active ? "●" : "○";
-		lines.push(`  ${mark} ${v.label}${active ? " (生效中)" : ""}`);
-		lines.push(`    ${kv("命中", `¥${v.prices.inputCacheHit}`, 8)}  ${kv("未命中", `¥${v.prices.inputCacheMiss}`, 8)}  ${kv("输出", `¥${v.prices.output}`, 8)}`);
-		if (v.note) lines.push(`    ${DIM}${v.note}${RESET}`);
+	lines.push(`  ${subTitle("当前生效价格 (¥/百万 tokens)")}`);
+	lines.push(`    ${kv("命中", `¥${debug.price.inputHit}`, 8)}  ${kv("未命中", `¥${debug.price.inputMiss}`, 8)}  ${kv("输出", `¥${debug.price.output}`, 8)}`);
+	lines.push("");
+	lines.push(`  ${subTitle("解析链 (first match wins)")}`);
+	for (const step of debug.chain) {
+		const mark = step.matched ? "●" : "○";
+		lines.push(`  ${mark} ${step.planName} · 规则 ${step.priceId}`);
+		lines.push(`      ${DIM}${step.reason}${RESET}`);
 	}
-	if (!adapter.hasPeakPricing) {
+	if (debug.chain.length === 0) {
+		lines.push(`  ${DIM}(该模型在共享价表中无绑定方案)${RESET}`);
+	}
+	if (!debug.matched) {
 		lines.push("");
-		lines.push("  该服务商无峰谷计费");
-	} else if (isPeakHour()) {
-		lines.push("");
-		lines.push("  高峰时段 (9:00~12:00, 14:00~18:00 北京时间), 价格 ×2");
-	} else {
-		lines.push("");
-		lines.push("  当前为低谷时段 (平时价)");
+		lines.push(`  ${DIM}未命中任何规则，使用兜底价。请用 /price 配置该模型。${RESET}`);
 	}
 	return lines;
 }
@@ -641,11 +601,13 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 		});
 		footerTui = tui;
 
-		// 定时全量校准 (默认 5 分钟): 纠偏本地台账漂移; 发现回充时闪 ▲
-		const balTimer = setInterval(() => {
-			const adapter = resolveProvider(ctx.model?.id);
-			if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
-		}, getRefreshMinutes() * 60 * 1000);
+			// 定时全量校准 (默认 5 分钟): 纠偏本地台账漂移; 发现回充时闪 ▲
+			// 顺带重渲染 footer —— 闲置跨过峰谷/自定义时段边界时, 计价标记随校准周期自动换算
+			const balTimer = setInterval(() => {
+				const adapter = resolveProvider(ctx.model?.id);
+				if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
+				requestFooterRender();
+			}, getRefreshMinutes() * 60 * 1000);
 
 		return {
 			dispose: () => {
@@ -662,7 +624,8 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const { total, lastTurn } = usage;
 				const cost = calculateCost(adapter, modelId, total);
 				const balSeg = balanceSegment(theme, adapter.id);
-				const peakSeg = adapter.hasPeakPricing ? theme.fg("dim", isPeakHour() ? "🕸️" : "🦦") : undefined;
+				const promptSeg = footerData.getExtensionStatuses().get("pi-prompt");
+				const peakSeg = footerSegPeak(theme, adapter.id, modelId);
 
 				// ── 第 1 行: workdir (branch) [+3-5] • session 名 …… 余额段 (右对齐) ──
 				// 余额/翻页动画/欠费态放这行右侧, 可见性最高; git 分色段紧随 branch 之后
@@ -676,8 +639,12 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const sessionName = ctx.getSessionName?.();
 				if (sessionName) pwdLeft += ` • ${sessionName}`;
 
-				// 第 1 行右侧降级链: 峰谷图标先丢, 余额段最后才可能被截
-				let r1parts = [balSeg, peakSeg].filter((p): p is string => p !== undefined);
+				// 第 1 行右侧降级链: prompt HUD 先丢, 再丢峰谷图标, 余额段最后才可能被截
+				// 顺序: [prompt] [余额] [峰谷] —— prompt 在余额左边 (用户指定), 峰谷图标留最右
+				let r1parts = [promptSeg, balSeg, peakSeg].filter((p): p is string => p !== undefined);
+				if (promptSeg && visibleWidth(r1parts.join(" ")) > width) {
+					r1parts = r1parts.filter((p) => p !== promptSeg);
+				}
 				if (peakSeg && visibleWidth(r1parts.join(" ")) > width) {
 					r1parts = r1parts.filter((p) => p !== peakSeg);
 				}
@@ -701,14 +668,14 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				if (planStatus) {
 					left2 += planStatus + " ";
 				}
-				let costText = fmtCurrency(cost.totalCNY, cost.free);
-				if (lastTurn) {
+				let costText = cost.priceKnown === false ? "价格未知" : fmtCurrency(cost.totalCNY, cost.free);
+				if (cost.priceKnown !== false && lastTurn) {
 					const turnCost = calculateCost(adapter, modelId, lastTurn);
 					const turnText = fmtCurrency(turnCost.totalCNY, turnCost.free);
 					costText = `${turnText}/${costText}`;
 				}
-				// 限时折扣等非默认变体标记
-				if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价" && !cost.free) {
+				// 计价方案标记 (来自 pi-pricer 解析链的方案名)
+				if (cost.variantLabel && !cost.free && cost.priceKnown !== false) {
 					costText += `·${cost.variantLabel}`;
 				}
 				// CH 缓存命中率分色: <90% dim (常态) / 90~95% accent 主题蓝 (良好) / ≥95% 紫 (优秀, ANSI 绕过主题)
@@ -761,7 +728,8 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const pad2 = " ".repeat(Math.max(2, width - visibleWidth(left2Shown) - right2W));
 				const line2 = left2Shown + pad2 + theme.fg("dim", right2);
 
-				// 单行紧凑布局: 统计 (左) …… 模型名 + 余额 + 峰谷 (右)
+				// 单行紧凑布局: 第 1 行 = 统计 (左) …… 模型名 + 余额 + 峰谷 (右),
+				// 第 2 行 = prompt HUD —— 单行只省横向不省纵向, 让 prompt 状态总有地方待
 				// 降级链: 丢峰谷图标 → 丢模型名 → 余额段最后才截; 左侧统计先截
 				if (getFooterLayout() === "single") {
 					const modelSeg3 = theme.fg("dim", modelName);
@@ -776,7 +744,10 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					const budget3 = Math.max(0, width - visibleWidth(right3) - 2);
 					const left3 = visibleWidth(left2) > budget3 ? truncateToWidth(left2, budget3) : left2;
 					const pad3 = " ".repeat(Math.max(2, width - visibleWidth(left3) - visibleWidth(right3)));
-					return [left3 + pad3 + right3];
+					const line3 = left3 + pad3 + right3;
+					if (!promptSeg) return [line3];
+					const promptPad = " ".repeat(Math.max(0, width - visibleWidth(promptSeg)));
+					return [line3, promptPad + promptSeg];
 				}
 
 				return [line1, line2];
@@ -854,7 +825,14 @@ function formatGitSegment(theme: Parameters<typeof balanceSegment>[0]): string |
 
 export default function (pi: ExtensionAPI) {
 	piRef = pi;
-	setCustomPricing(getCustomPricing()); // 加载用户自定义计价规则
+	let pricerHintShown = false;
+	// 预热共享价表 (pi-pricer); 失败不阻塞启动, 由首次提示与 /usage 曝光
+	void ensurePricingSource().then(() => {
+		const { source, reason } = getPricingSource();
+		if (source !== "pi-pricer") {
+			debugLog(`pricing source=${source} reason=${reason ?? "-"}`);
+		}
+	});
 	let statusEnabled = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -866,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
-			ctx.ui.notify(formatVariantStatus(adapter, modelId, getCustomPricing(adapter.id)).join("\n"), "info");
+			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
 			return;
 		}
 
@@ -880,7 +858,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.setStatus(pid, `${current.name} ⚠️欠费`);
 				} else if (b && isBalance(b) && b.available) {
 					const total = parseFloat(b.total);
-					const peak = current.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
+					const peak = peakStatusSuffix(pid, modelId);
 					const text = `💰¥${total.toFixed(2)}`;
 					ctx.ui.setStatus(pid, total < 0 ? `${current.name} ${text}（透支预警）${peak}` : `${current.name} ${text}${peak}`);
 				} else if (b && "error" in b) {
@@ -1064,19 +1042,34 @@ export default function (pi: ExtensionAPI) {
 			if (isDepleted(adapter.id)) {
 				ctx.ui.setStatus(adapter.id, `${adapter.name} ⚠️欠费`);
 			} else if (b.available) {
-				const peak = adapter.hasPeakPricing ? (isPeakHour() ? " 🕸️" : " 🦦") : "";
+				const peak = peakStatusSuffix(adapter.id, undefined);
 				ctx.ui.setStatus(adapter.id, `${adapter.name} 💰¥${parseFloat(b.total).toFixed(2)}${peak}`);
 			}
 		}
 	});
 
 	// ── 默认启动时自动开启 footer ──
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		footerEnabled = true;
 		enableFooter(ctx, { silent: true });
 		// 启动即显示持久化缓存; 异步校准纠偏 (两会话间充了值会闪 ▲)
 		const adapter = resolveProvider(ctx.model?.id);
 		if (adapter.queryBalance) void calibrateProvider(adapter.id, { flash: true });
+		// 共享价表不可用提示 (每会话一次; 未装先保证预热已完成再判态)
+		if (pricerHintShown) return;
+		await ensurePricingSource();
+		const { source, reason } = getPricingSource();
+		pricerHintShown = true;
+		switch (source) {
+			case "pi-pricer":
+				return;
+			case "failed":
+				ctx.ui.notify(`pi-pricer 价格解析失败（${reason ?? "未知原因"}），费用无法估算。请检查 ~/.pi/model-pricing.json。`, "warning");
+				return;
+			case "missing":
+				ctx.ui.notify(`pi-usager 现已使用共享价表计费，${PRICER_INSTALL_HINT}`, "warning");
+				return;
+		}
 	});
 
 	// ── 清理 ──

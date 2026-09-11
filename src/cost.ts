@@ -1,112 +1,13 @@
 /**
- * 通用计价核心: 阶梯解析 → 变体选择 → 费用计算
- * 所有费用单位为人民币 ¥
+ * 通用计价核心: 取共享价表 → 计算费用
+ *
+ * 价格不再由本插件维护 —— 全部来自 @foolsecret/pi-pricer 的共享价表
+ * (~/.pi/model-pricing.json), 见 pricing-source.ts。
+ * 所有费用单位为人民币 ¥。
  */
 
-import type { ProviderAdapter, ModelPricing, PriceVariant, UnitPrices, Usage, CostBreakdown, PriceTier, CustomPricing } from "./types.ts";
-
-// ═══════════════════════════════════════════
-//  定价解析
-// ═══════════════════════════════════════════
-
-/** 在 provider 定价表中按 key 长度降序模糊匹配模型 (glm-5.3 不会误配到 glm-5.3-flash) */
-export function lookupPricing(adapter: ProviderAdapter, modelId: string | undefined): ModelPricing | undefined {
-	if (!modelId) return adapter.fallbackPricing;
-	const keys = Object.keys(adapter.pricing).sort((a, b) => b.length - a.length);
-	for (const key of keys) {
-		if (modelId.toLowerCase().includes(key)) return adapter.pricing[key];
-	}
-	return adapter.fallbackPricing;
-}
-
-function tierMatches(tier: PriceTier, input: number, output: number): boolean {
-	const m = tier.match;
-	if (!m) return true; // 兜底阶梯
-	if (m.inputMinK !== undefined && input < m.inputMinK * 1000) return false;
-	if (m.inputMaxK !== undefined && input >= m.inputMaxK * 1000) return false;
-	if (m.outputMinM !== undefined && output < m.outputMinM * 1_000_000) return false;
-	if (m.outputMaxM !== undefined && output >= m.outputMaxM * 1_000_000) return false;
-	return true;
-}
-
-/** 选择当前时间生效的计价变体: active 命中 → default → 第一个 */
-export function resolveVariant(tier: PriceTier, now: Date): PriceVariant {
-	const actives = tier.variants.filter((v) => v.active?.(now));
-	if (actives.length > 0) return actives[0];
-	const fallback = tier.variants.find((v) => v.default);
-	return fallback ?? tier.variants[0];
-}
-
-export interface ResolvedPricing {
-	prices: UnitPrices;
-	free: boolean;
-	variantLabel?: string;
-	variantNote?: string;
-	/** 是否命中了非兜底阶梯 (跨档提示用) */
-	tierMatched: boolean;
-}
-
-// ═════════════════════════════════════════
-//  自定义计价 (用户规则, 优先级高于内置定价)
-// ═════════════════════════════════════════
-
-let customRules: CustomPricing[] = [];
-
-/** 由扩展在启动时与配置变更后注入 (单进程内存注册表) */
-export function setCustomPricing(rules: CustomPricing[]): void {
-	customRules = rules;
-}
-
-/** 时段是否在当前时刻生效 (支持跨午夜: endHour <= startHour) */
-export function periodActive(p: { days?: number[]; startHour: number; endHour: number }, now: Date): boolean {
-	if (p.days && !p.days.includes(now.getDay())) return false;
-	const h = now.getHours();
-	return p.endHour > p.startHour
-		? h >= p.startHour && h < p.endHour
-		: h >= p.startHour || h < p.endHour;
-}
-
-/** 自定义规则求值: 声明序首个 pattern 命中 → 时段轮询 → 未命中时段用 base */
-export function resolveCustomPricing(rules: CustomPricing[], providerId: string, modelId: string | undefined, now: Date): ResolvedPricing | undefined {
-	const rule = rules.find(
-		(r) => r.providerId === providerId && modelId !== undefined && modelId.toLowerCase().includes(r.pattern.toLowerCase()),
-	);
-	if (!rule) return undefined;
-	const period = rule.periods?.find((p) => periodActive(p, now));
-	if (period) {
-		return { prices: period.prices, free: false, variantLabel: period.label, variantNote: rule.note, tierMatched: true };
-	}
-	return { prices: rule.base, free: false, variantLabel: "自定义计价", variantNote: rule.note, tierMatched: true };
-}
-
-/** 完整解析: 免费模型 → 阶梯匹配 → 变体选择 */
-export function resolvePricing(
-	pricing: ModelPricing,
-	input: number,
-	output: number,
-	now: Date,
-): ResolvedPricing {
-	if (pricing.free) {
-		return {
-			prices: { inputCacheHit: 0, inputCacheMiss: 0, output: 0 },
-			free: true,
-			variantLabel: "FREE",
-			tierMatched: true,
-		};
-	}
-	const tiers = pricing.tiers?.length ? pricing.tiers : [{ variants: [] as PriceVariant[] }];
-	let tier = tiers.find((t) => tierMatches(t, input, output));
-	const tierMatched = tier !== undefined && tier.match !== undefined;
-	if (!tier) tier = tiers[tiers.length - 1]; // 最后一个阶梯兜底
-	const variant = resolveVariant(tier, now);
-	return {
-		prices: variant.prices,
-		free: false,
-		variantLabel: variant.label,
-		variantNote: variant.note,
-		tierMatched,
-	};
-}
+import type { ProviderAdapter, Usage, CostBreakdown } from "./types.ts";
+import { getPricingResolver, resolvePrice } from "./pricing-source.ts";
 
 // ═══════════════════════════════════════════
 //  费用计算
@@ -115,6 +16,11 @@ export function resolvePricing(
 /**
  * 计算费用。usage.input 为不含缓存命中的纯输入 (cache miss),
  * usage.cacheRead 为缓存命中 token 数。
+ *
+ * 价格来自 pi-pricer 的 resolvePricing(model, provider, now) —— 峰谷/节假日/
+ * 促销等规则由其 first-match-wins 解析链决定, 本插件不做任何价格判断。
+ * 未装 pi-pricer 或解析失败时返回 free=false 且 totalCNY=0, 由调用方
+ * 展示"价格未知"而非误导性数字。
  */
 export function calculateCost(
 	adapter: ProviderAdapter,
@@ -122,40 +28,27 @@ export function calculateCost(
 	usage: Usage,
 	now = new Date(),
 ): CostBreakdown {
-	// 自定义计价优先: 用户规则完全接管命中模型 (含免费判定)
-	const custom = resolveCustomPricing(customRules, adapter.id, modelId, now);
-	if (custom) {
-		const p = custom.prices;
-		const inputMissCost = (usage.input / 1_000_000) * p.inputCacheMiss;
-		const inputHitCost = (usage.cacheRead / 1_000_000) * p.inputCacheHit;
-		const outputCost = (usage.output / 1_000_000) * p.output;
-		return {
-			inputMissCost,
-			inputHitCost,
-			outputCost,
-			totalCNY: inputMissCost + inputHitCost + outputCost,
-			free: false,
-			variantLabel: custom.variantLabel,
-			variantNote: custom.variantNote,
-		};
+	if (!modelId) {
+		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false, priceKnown: false };
 	}
-	const pricing = lookupPricing(adapter, modelId);
-	if (!pricing) {
-		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false };
+	const price = resolvePrice(modelId, adapter.id, now);
+	if (!price) {
+		// 共享价表不可用: 不估算, 交由调用方按 getPricingSource() 提示
+		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false, priceKnown: false };
 	}
-	const r = resolvePricing(pricing, usage.input, usage.output, now);
-	const p = r.prices;
-	const inputMissCost = (usage.input / 1_000_000) * p.inputCacheMiss;
-	const inputHitCost = (usage.cacheRead / 1_000_000) * p.inputCacheHit;
-	const outputCost = (usage.output / 1_000_000) * p.output;
+	// 三价全零 = 该模型配置为免费
+	const free = price.inputMiss === 0 && price.inputHit === 0 && price.output === 0;
+	const inputMissCost = (usage.input / 1_000_000) * price.inputMiss;
+	const inputHitCost = (usage.cacheRead / 1_000_000) * price.inputHit;
+	const outputCost = (usage.output / 1_000_000) * price.output;
 	return {
-		inputMissCost: r.free ? 0 : inputMissCost,
-		inputHitCost: r.free ? 0 : inputHitCost,
-		outputCost: r.free ? 0 : outputCost,
-		totalCNY: r.free ? 0 : inputMissCost + inputHitCost + outputCost,
-		free: r.free,
-		variantLabel: r.variantLabel,
-		variantNote: r.variantNote,
+		inputMissCost: free ? 0 : inputMissCost,
+		inputHitCost: free ? 0 : inputHitCost,
+		outputCost: free ? 0 : outputCost,
+		totalCNY: free ? 0 : inputMissCost + inputHitCost + outputCost,
+		free,
+		isPeak: price.isPeak,
+		priceKnown: true,
 	};
 }
 
@@ -219,4 +112,9 @@ export function hitRate(input: number, cacheRead: number): string {
 	const denom = input + cacheRead;
 	if (denom <= 0) return "0.0";
 	return ((cacheRead / denom) * 100).toFixed(1);
+}
+
+/** 价表可用性 (footer 展示"价格未知"与峰谷图标判定用) */
+export function isPriceKnown(): boolean {
+	return getPricingResolver() !== null;
 }

@@ -62,13 +62,13 @@ export function getCredentials(providerId: string, envKeys: string[], authJsonKe
 	if (fromConfig && Object.keys(fromConfig).length > 0) return fromConfig;
 	for (const envKey of envKeys) {
 		const v = process.env[envKey];
-		if (v) return { [envKeys[0]]: v };
+		if (v) return { apiKey: v };
 	}
 	const auth = readAuthJson();
 	if (auth) {
 		for (const authKey of authJsonKeys) {
 			const v = auth[authKey]?.key;
-			if (v) return { [envKeys[0]]: v };
+			if (v) return { apiKey: v };
 		}
 	}
 	return {};

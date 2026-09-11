@@ -2,96 +2,10 @@
  * 使用量/计费公共类型定义
  *
  * 设计要点:
+ * - 价格数据不再由本插件维护: 全部来自 @foolsecret/pi-pricer 的共享价表
  * - 统一人民币 ¥ 计价（所有 provider 的价格均为 元/百万 tokens）
- * - 支持 阶梯定价（按输入/输出长度分档）
- * - 支持 计价变体（同一模型的多个价格, 按时间自动切换, 如限时折扣/峰谷定价）
- * - 支持免费模型（显示 FREE）
+ * - 免费判定: 共享价表返回三价全零
  */
-
-/** 一组单价 (元/百万 tokens) */
-export interface UnitPrices {
-	/** 输入 (缓存命中) */
-	inputCacheHit: number;
-	/** 输入 (缓存未命中) */
-	inputCacheMiss: number;
-	/** 输出 */
-	output: number;
-}
-
-/** 阶梯匹配条件。未指定的维度表示不限。 */
-export interface TierMatch {
-	/** 输入长度下界 (含), 单位: 千 tokens, 如 32 表示输入 >= 32k */
-	inputMinK?: number;
-	/** 输入长度上界 (不含), 单位: 千 tokens, 如 32 表示输入 < 32k */
-	inputMaxK?: number;
-	/** 输出长度下界 (含), 单位: 百万 tokens, 如 0.2 表示输出 >= 0.2M */
-	outputMinM?: number;
-	/** 输出长度上界 (不含), 单位: 百万 tokens */
-	outputMaxM?: number;
-}
-
-/**
- * 计价变体: 同一模型在不同时间/时段可能适用的价格。
- * 解析顺序: active(now) === true 的变体优先 → default 变体 → 第一个变体。
- */
-export interface PriceVariant {
-	/** 变体名称, 如 "限时5折" / "原价" / "高峰价" / "平时价" */
-	label: string;
-	/** 该变体下的单价 */
-	prices: UnitPrices;
-	/** 生效判断 (如限时折扣有效期、峰谷时段)。无则视为始终适用。 */
-	active?: (now: Date) => boolean;
-	/** 备注, 如 "截至 2026-09-09" */
-	note?: string;
-	/** 无任何 active 变体命中时的兜底变体 */
-	default?: boolean;
-}
-
-/** 一个阶梯: 匹配条件 + 该阶梯下的计价变体列表 */
-export interface PriceTier {
-	/** 匹配条件, 不填则作为兜底阶梯 */
-	match?: TierMatch;
-	/** 该阶梯下的计价变体 */
-	variants: PriceVariant[];
-}
-
-/** 单个模型的定价描述 */
-export interface ModelPricing {
-	/** 阶梯列表 (按声明顺序匹配, 第一个命中的生效; 无阶梯时用单阶梯) */
-	tiers: PriceTier[];
-	/** 免费模型 (费用显示 FREE) */
-	free?: boolean;
-	/** 缓存存储费 (元/百万tokens/小时); GLM 当前限时免费, 仅作备注展示 */
-	cacheStorageNote?: string;
-}
-
-/** 自定义计价的时段规则 (闹钟式: 生效日 + 小时区间) */
-export interface PricingPeriod {
-	/** 时段名称, 如 "高峰" / "低谷" */
-	label: string;
-	/** 该时段单价 (¥/百万 tokens) */
-	prices: UnitPrices;
-	/** 生效日: 0~6 (0=周日); 缺省 = 每天 */
-	days?: number[];
-	/** 起始小时 (含), 0~23 */
-	startHour: number;
-	/** 结束小时 (不含), 0~23; endHour <= startHour 视为跨午夜 (如 22~6) */
-	endHour: number;
-}
-
-/** 用户自定义计价规则 (优先级高于内置定价, 完全接管该模型) */
-export interface CustomPricing {
-	/** 厂商 id (glm / deepseek) */
-	providerId: string;
-	/** 模型模糊匹配串: modelId.includes(pattern), 不区分大小写 */
-	pattern: string;
-	/** 基础单价 (¥/百万 tokens), 未命中任何时段时使用 (平时价) */
-	base: UnitPrices;
-	/** 时段表 (峰谷/活动价), 缺省 = 恒用 base */
-	periods?: PricingPeriod[];
-	/** 备注, 如 "9/10 官方新价" */
-	note?: string;
-}
 
 /** 账户余额 (统一结构) */
 export interface ProviderBalance {
@@ -114,12 +28,6 @@ export interface ProviderAdapter {
 	currency: "CNY";
 	/** 当前选中的模型是否属于该 provider */
 	matchModel(modelId: string | undefined): boolean;
-	/** 定价表。查找时按 key 长度降序模糊匹配 modelId (避免 glm-5.3 误配到 glm-5.3-flash) */
-	pricing: Record<string, ModelPricing>;
-	/** 未在 pricing 中命中时的兜底定价 */
-	fallbackPricing?: ModelPricing;
-	/** 是否存在峰谷/时段计费 (决定 footer 是否显示峰谷图标) */
-	hasPeakPricing: boolean;
 	/** 查询账户余额 (provider 无公开 API 时不实现) */
 	queryBalance?(): Promise<BalanceResult>;
 	/** 无歧义的欠费 HTTP 状态码 (如 DeepSeek 402, 实测确认)。有歧义的码 (如 GLM 429,
@@ -154,19 +62,18 @@ export interface CostBreakdown {
 	totalCNY: number;
 	/** 免费模型 */
 	free: boolean;
-	/** 当前生效的计价变体 label, 如 "限时5折" / "高峰价" */
+	/** 命中规则是否含时间窗 (峰谷/促销时段) —— 供峰谷图标显示 */
+	isPeak?: boolean;
+	/** 价表是否可用 (false = 未装 pi-pricer / 解析失败, 费用为未知) */
+	priceKnown?: boolean;
+	/** 当前生效的计价方案 label (来自 pi-pricer 解析链) */
 	variantLabel?: string;
-	/** 变体备注, 如 "截至 2026-09-09" */
+	/** 方案备注 */
 	variantNote?: string;
 }
 
-/** 时区辅助: 北京时间小时数 */
-export function beijingHour(now = new Date()): number {
-	return (now.getUTCHours() + 8) % 24;
-}
-
-/** 构造未来时间判断 (限时优惠截止) */
-export function until(isoDateTime: string): (now: Date) => boolean {
-	const end = new Date(isoDateTime).getTime();
-	return (now) => now.getTime() < end;
+/** 北京时间 (UTC+8) 的星期与小时 (供厂商适配器判断时段展示) */
+export function beijingParts(now = new Date()): { day: number; hour: number } {
+	const shifted = new Date(now.getTime() + 8 * 3_600_000);
+	return { day: shifted.getUTCDay(), hour: shifted.getUTCHours() };
 }

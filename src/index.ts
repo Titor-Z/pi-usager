@@ -18,15 +18,12 @@ export const genericAdapter: ProviderAdapter = {
 	name: "通用",
 	currency: "CNY",
 	matchModel: () => false,
-	hasPeakPricing: false,
-	pricing: {},
 	billingNote: "未识别的模型/服务商, 无法估算费用 (仅统计 token 用量)",
 	cacheNote: "以 pi 上报的 usage.cacheRead 作为缓存命中统计",
 };
 
-// TODO(可选增强): 定价表目前为手动维护 + 变体自动切换。
-// bigmodel.cn/pricing 为 JS 渲染且无稳定 JSON 端点, 若未来提供官方价格 API,
-// 可在此增加远端拉取/校验逻辑, 定期刷新各 adapter 的 pricing。
+// 定价数据统一由 @foolsecret/pi-pricer 维护 (~/.pi/model-pricing.json),
+// 本插件不再内置任何价格; 改价请用 /price 面板。
 
 /** 按当前模型自动选择 provider 适配器 */
 export function resolveProvider(modelId: string | undefined): ProviderAdapter {
