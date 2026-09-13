@@ -73,6 +73,11 @@ function describePricingSource(source: PricingSource, reason?: string): string {
 	}
 }
 
+/** 价表 provider: 优先运行时 pi provider, 回退适配器声明的 priceProvider/id */
+function pricingProvider(adapter: ProviderAdapter, modelProvider?: string): string {
+	return modelProvider ?? adapter.priceProvider ?? adapter.id;
+}
+
 /** 方案展示名: 别名优先 (HUD 短名), 无别名用方案全名 */
 function planDisplayName(planName?: string, planAlias?: string): string | undefined {
 	const name = planAlias?.trim() || planName?.trim();
@@ -400,9 +405,10 @@ function formatUsageText(
 	adapter: ProviderAdapter,
 	stats: ReturnType<typeof getSessionUsage>,
 	modelId: string | undefined,
+	providerId: string,
 ): string[] {
 	const { total, lastTurn, messageCount } = stats;
-	const cost = calculateCost(adapter, modelId, total);
+	const cost = calculateCost(adapter, modelId, total, new Date(), providerId);
 	const lines: string[] = [sectionTitle(`当前会话用量 · ${adapter.name}`), ""];
 	lines.push(`  ${kv("模型", modelId ?? "未知", 12)}`);
 	lines.push(`  ${kv("消息轮次", String(messageCount), 12)}`);
@@ -412,7 +418,7 @@ function formatUsageText(
 	lines.push(`  ${kv("缓存命中率", `${hitRate(total.input, total.cacheRead)}%`, 12)}`);
 
 	if (lastTurn) {
-		const turnCost = calculateCost(adapter, modelId, lastTurn);
+		const turnCost = calculateCost(adapter, modelId, lastTurn, new Date(), providerId);
 		lines.push(`  ${kv("最近一次回答", fmtCurrency(turnCost.totalCNY, turnCost.free))}`);
 	}
 
@@ -448,9 +454,9 @@ function formatUsageText(
 //  计价变体状态 (/usage peak)
 // ═══════════════════════════════════════════
 
-function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined): string[] {
+function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefined, providerId: string): string[] {
 	if (!modelId) return [sectionTitle(`计价状态 · ${adapter.name}`), "", "  当前无选中模型"];
-	const debug = resolveDebug(modelId, adapter.id, new Date());
+	const debug = resolveDebug(modelId, providerId, new Date());
 	if (!debug) {
 		return [
 			sectionTitle(`计价状态 · ${adapter.name}`),
@@ -459,7 +465,7 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 			`  ${DIM}${PRICER_INSTALL_HINT}${RESET}`,
 		];
 	}
-	const plan = getPlanDetail(adapter.id, modelId);
+	const plan = getPlanDetail(providerId, modelId);
 	const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name}`), ""];
 	lines.push(`  ${kv("当前模型", modelId, 10)}`);
 	const planName = planDisplayName(plan?.planName, plan?.planAlias)
@@ -709,13 +715,13 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const modelId = ctx.model?.id;
 				const usage = getSessionUsage(ctx);
 				const { total, lastTurn } = usage;
-				const cost = calculateCost(adapter, modelId, total);
+				const cost = calculateCost(adapter, modelId, total, new Date(), ctx.model?.provider);
 				const balSeg = balanceSegment(theme, adapter.id);
 				const promptSeg = footerData.getExtensionStatuses().get("pi-prompt");
 				// 双行/单行均去 PROMPT 前缀 —— 均改用 usager 主题 dim 色重新着色
 				const promptSegDual = promptSeg && restylePromptSeg(promptSeg, theme, true);
 				const promptSegSingle = promptSeg && restylePromptSeg(promptSeg, theme, true);
-				const peakSeg = footerSegPeak(theme, adapter.id, modelId);
+				const peakSeg = footerSegPeak(theme, pricingProvider(adapter, ctx.model?.provider), modelId);
 
 				// ── 第 1 行: workdir@branch [+N-M] • session 名 …… 余额段 (右对齐) ──
 				// 余额/翻页动画/欠费态放这行右侧, 可见性最高; git 分色段紧随 branch 之后
@@ -779,7 +785,7 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				}
 				let costText = cost.priceKnown === false ? "价格未知" : fmtCurrency(cost.totalCNY, cost.free);
 				if (cost.priceKnown !== false && lastTurn) {
-					const turnCost = calculateCost(adapter, modelId, lastTurn);
+					const turnCost = calculateCost(adapter, modelId, lastTurn, new Date(), ctx.model?.provider);
 					const turnText = fmtCurrency(turnCost.totalCNY, turnCost.free);
 					costText = `${turnText}/${costText}`;
 				}
@@ -963,7 +969,7 @@ export default function (pi: ExtensionAPI) {
 
 		// ── /usage peak ── 当前计价变体状态
 		if (cmd === "peak") {
-			ctx.ui.notify(formatVariantStatus(adapter, modelId).join("\n"), "info");
+			ctx.ui.notify(formatVariantStatus(adapter, modelId, pricingProvider(adapter, ctx.model?.provider)).join("\n"), "info");
 			return;
 		}
 
@@ -977,7 +983,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.setStatus(pid, `${current.name} ⚠️欠费`);
 				} else if (b && isBalance(b) && b.available) {
 					const total = parseFloat(b.total);
-					const peak = peakStatusSuffix(pid, modelId);
+					const peak = peakStatusSuffix(pricingProvider(current, ctx.model?.provider), modelId);
 					const text = `💰¥${total.toFixed(2)}`;
 					ctx.ui.setStatus(pid, total < 0 ? `${current.name} ${text}（透支预警）${peak}` : `${current.name} ${text}${peak}`);
 				} else if (b && "error" in b) {
@@ -1038,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
 		// ── /usage session ──
 		if (cmd === "session") {
 			const stats = getSessionUsage(ctx);
-			ctx.ui.notify(formatUsageText(adapter, stats, modelId).join("\n"), "info");
+			ctx.ui.notify(formatUsageText(adapter, stats, modelId, pricingProvider(adapter, ctx.model?.provider)).join("\n"), "info");
 			return;
 		}
 
@@ -1053,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
 				lines.push(...formatBalanceText(adapter, balance));
 			}
 			lines.push("");
-			lines.push(...formatUsageText(adapter, stats, modelId));
+			lines.push(...formatUsageText(adapter, stats, modelId, pricingProvider(adapter, ctx.model?.provider)));
 			ctx.ui.notify(lines.join("\n"), "info");
 			return;
 		}
@@ -1090,7 +1096,7 @@ export default function (pi: ExtensionAPI) {
 			output: u.output ?? 0,
 			cacheRead: u.cacheRead ?? 0,
 			cacheWrite: u.cacheWrite ?? 0,
-		});
+		}, new Date(), ctx.model?.provider);
 		if (cost.free || cost.totalCNY <= 0) {
 			debugLog(`turn_end ${adapter.id}: FREE/零费用, 不扣减不翻页`);
 			return; // FREE 模型不扣减不翻页
@@ -1161,7 +1167,7 @@ export default function (pi: ExtensionAPI) {
 			if (isDepleted(adapter.id)) {
 				ctx.ui.setStatus(adapter.id, `${adapter.name} ⚠️欠费`);
 			} else if (b.available) {
-				const peak = peakStatusSuffix(adapter.id, undefined);
+				const peak = peakStatusSuffix(pricingProvider(adapter, ctx.model?.provider), undefined);
 				ctx.ui.setStatus(adapter.id, `${adapter.name} 💰¥${parseFloat(b.total).toFixed(2)}${peak}`);
 			}
 		}

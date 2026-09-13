@@ -45,7 +45,7 @@ if (process.env.VERIFY_SCENARIO) {
 	};
 	const ctx = {
 		hasUI: true, cwd: process.cwd(),
-		model: { id: "deepseek-flash", provider: "deepseek", contextWindow: 128000 },
+		model: { id: "deepseek-v4-flash", provider: "deepseek", contextWindow: 128000 },
 		thinkingLevel: "off",
 		sessionManager: { getBranch: () => [] },
 		getSessionName: () => "verify",
@@ -62,7 +62,7 @@ if (process.env.VERIFY_SCENARIO) {
 	handlers.get("turn_start")({ type: "turn_start" }, ctx);
 
 	const adapter = { id: "deepseek", name: "DeepSeek", currency: "CNY", matchModel: () => true };
-	const priced = cost.calculateCost(adapter, "deepseek-flash",
+	const priced = cost.calculateCost(adapter, "deepseek-v4-flash",
 		{ input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 });
 
 	// 同时探一下解析器是否真的可用 (区分 missing/failed)
@@ -132,7 +132,7 @@ function v5Fixture({ inputMiss, inputHit, output, alias }) {
 			weekdays: [], ranges: [], includeCalendars: [], excludeCalendars: [], includeDates: [], excludeDates: [],
 		}],
 		plans: [{ _id: "0000000000000021", createdAt: "2026-01-01T00:00:02.000Z", name: "我的方案", ...(alias ? { alias } : {}), enabled: true, ruleIds: ["0000000000000011"] }],
-		models: [{ _id: "0000000000000031", createdAt: "2026-01-01T00:00:03.000Z", provider: "deepseek", model: "deepseek-flash", planId: "0000000000000021" }],
+		models: [{ _id: "0000000000000031", createdAt: "2026-01-01T00:00:03.000Z", provider: "deepseek", model: "deepseek-v4-flash", planId: "0000000000000021" }],
 	};
 }
 

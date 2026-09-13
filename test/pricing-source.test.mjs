@@ -26,7 +26,7 @@ const adapter = { id: "deepseek", name: "DeepSeek", currency: "CNY", matchModel:
 const usage = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
 
 /** v5 价表夹具: 单价格 + 单规则 + 单方案(可带别名) + 单模型 (对齐 Schema v5 五集合) */
-function v5Fixture({ inputMiss, inputHit, output, alias, planName = "我的方案", ruleName = "我的规则" }) {
+function v5Fixture({ inputMiss, inputHit, output, alias, planName = "我的方案", ruleName = "我的规则", provider = "deepseek", model = "deepseek-v4-flash" }) {
 	return {
 		version: 5,
 		rates: [{ _id: "0000000000000001", createdAt: "2026-01-01T00:00:00.000Z", name: "我的价", inputMiss, inputHit, output }],
@@ -40,7 +40,7 @@ function v5Fixture({ inputMiss, inputHit, output, alias, planName = "我的方�
 			_id: "0000000000000021", createdAt: "2026-01-01T00:00:02.000Z", name: planName,
 			...(alias ? { alias } : {}), enabled: true, ruleIds: ["0000000000000011"],
 		}],
-		models: [{ _id: "0000000000000031", createdAt: "2026-01-01T00:00:03.000Z", provider: "deepseek", model: "deepseek-flash", planId: "0000000000000021" }],
+		models: [{ _id: "0000000000000031", createdAt: "2026-01-01T00:00:03.000Z", provider, model, planId: "0000000000000021" }],
 	};
 }
 
@@ -58,7 +58,7 @@ test("三态: 未安装 -> missing, 费用未知 (priceKnown=false)", async () =
 	source.resetPricingSource();
 	await source.ensurePricingSource(async () => null);
 	assert.equal(source.getPricingSource().source, "missing");
-	const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+	const r = cost.calculateCost(adapter, "deepseek-v4-flash", usage);
 	assert.equal(r.priceKnown, false);
 	assert.equal(r.totalCNY, 0, "不得算出误导性金额");
 });
@@ -77,7 +77,7 @@ test("三态: 加载成功 -> pi-pricer, 按三价换算费用", async () => {
 	source.resetPricingSource();
 	await source.ensurePricingSource(async () => () => ({ inputMiss: 1, inputHit: 0.02, output: 4, isPeak: false }));
 	assert.equal(source.getPricingSource().source, "pi-pricer");
-	const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+	const r = cost.calculateCost(adapter, "deepseek-v4-flash", usage);
 	// 1M miss × 1 + 1M hit × 0.02 + 1M out × 4 = 5.02
 	assert.ok(Math.abs(r.totalCNY - 5.02) < 1e-9, `期望 5.02, 实际 ${r.totalCNY}`);
 	assert.equal(r.priceKnown, true);
@@ -89,12 +89,37 @@ test("方案别名优先: variantLabel = planAlias（无别名回退 planName）
 	await source.ensurePricingSource(async () => () => ({
 		inputMiss: 1, inputHit: 0, output: 1, isPeak: false, planName: "方案全名", planAlias: "短名",
 	}));
-	assert.equal(cost.calculateCost(adapter, "deepseek-flash", usage).variantLabel, "短名");
+	assert.equal(cost.calculateCost(adapter, "deepseek-v4-flash", usage).variantLabel, "短名");
 	source.resetPricingSource();
 	await source.ensurePricingSource(async () => () => ({
 		inputMiss: 1, inputHit: 0, output: 1, isPeak: false, planName: "方案全名",
 	}));
-	assert.equal(cost.calculateCost(adapter, "deepseek-flash", usage).variantLabel, "方案全名");
+	assert.equal(cost.calculateCost(adapter, "deepseek-v4-flash", usage).variantLabel, "方案全名");
+});
+
+test("定价 provider: 用 priceProvider（GLM→zai），不误用 adapter.id", async () => {
+	source.resetPricingSource();
+	let seen = "";
+	await source.ensurePricingSource(async () => (model, provider) => {
+		seen = provider;
+		return { inputMiss: 1, inputHit: 0, output: 1, isPeak: false, planName: "GLM 方案", planAlias: "GLM 默认" };
+	});
+	const glm = { id: "glm", priceProvider: "zai", name: "GLM", currency: "CNY", matchModel: () => true };
+	const r = cost.calculateCost(glm, "glm-5.3-flash", usage);
+	assert.equal(seen, "zai", "价表 provider 应为 pi 真实 id zai");
+	assert.equal(r.variantLabel, "GLM 默认");
+});
+
+test("定价 provider: 运行时 provider 优先于 priceProvider", async () => {
+	source.resetPricingSource();
+	let seen = "";
+	await source.ensurePricingSource(async () => (model, provider) => {
+		seen = provider;
+		return { inputMiss: 1, inputHit: 0, output: 1, isPeak: false };
+	});
+	const glm = { id: "glm", priceProvider: "zai", name: "GLM", currency: "CNY", matchModel: () => true };
+	cost.calculateCost(glm, "glm-5.3-flash", usage, new Date(), "zai-coding-cn");
+	assert.equal(seen, "zai-coding-cn", "运行时 pi provider 应覆盖静态 priceProvider");
 });
 
 test("免费判定: 三价全零 -> free 且金额为 0", async () => {
@@ -108,7 +133,7 @@ test("免费判定: 三价全零 -> free 且金额为 0", async () => {
 test("峰谷: isPeak 从价表透传到 CostBreakdown", async () => {
 	source.resetPricingSource();
 	await source.ensurePricingSource(async () => () => ({ inputMiss: 2, inputHit: 0.04, output: 8, isPeak: true }));
-	const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+	const r = cost.calculateCost(adapter, "deepseek-v4-flash", usage);
 	assert.equal(r.isPeak, true);
 });
 
@@ -153,12 +178,12 @@ test("真实 pi-pricer: v5 价表驱动费用 + 别名 + 解析链 + 方案结�
 			return;
 		}
 		assert.equal(source.getPricingSource().source, "pi-pricer");
-		const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+		const r = cost.calculateCost(adapter, "deepseek-v4-flash", usage);
 		assert.ok(Math.abs(r.totalCNY - 31) < 1e-9, `期望 31 (10+1+20), 实际 ${r.totalCNY}`);
 		assert.equal(r.variantLabel, "我的别名", "别名优先透传到 variantLabel");
 
 		// 解析链 (v5: ruleName + rateId)
-		const debug = source.resolveDebug("deepseek-flash", "deepseek", new Date("2026-01-01T00:00:00.000Z"));
+		const debug = source.resolveDebug("deepseek-v4-flash", "deepseek", new Date("2026-01-01T00:00:00.000Z"));
 		assert.ok(debug, "resolveDebug 应可用");
 		assert.equal(debug.matched, true);
 		assert.equal(debug.chain.length, 1);
@@ -166,7 +191,7 @@ test("真实 pi-pricer: v5 价表驱动费用 + 别名 + 解析链 + 方案结�
 		assert.equal(debug.chain[0].rateId, "0000000000000001");
 
 		// 方案结构展开 (/db explainPlan)
-		const plan = source.getPlanDetail("deepseek", "deepseek-flash");
+		const plan = source.getPlanDetail("deepseek", "deepseek-v4-flash");
 		assert.ok(plan, "getPlanDetail 应可用");
 		assert.equal(plan.planAlias, "我的别名");
 		assert.equal(plan.rules.length, 1);
@@ -180,6 +205,35 @@ test("真实 pi-pricer: v5 价表驱动费用 + 别名 + 解析链 + 方案结�
 });
 
 // ── 内置默认价 vs 用户价表（本次事故核心） ───────────────────────────
+
+test("真实 pi-pricer: GLM 用 zai provider 命中方案 (未安装则 skip)", async (t) => {
+	if (!(await pricerAvailable())) {
+		t.skip("pi-pricer 不可用，跳过用例");
+		return;
+	}
+	const { writeFileSync, mkdtempSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const dir = mkdtempSync(join(tmpdir(), "pi-usager-glm-"));
+	try {
+		const pricingPath = join(dir, "model-pricing.json");
+		writeFileSync(pricingPath, JSON.stringify(v5Fixture({
+			inputMiss: 0.8, inputHit: 0.23, output: 2.8, alias: "GLM 默认", planName: "glm-5.3-flash 方案",
+			provider: "zai", model: "glm-5.3-flash",
+		})), "utf8");
+		source.resetPricingSource();
+		await source.ensurePricingSource(undefined, pricingPath);
+		if (source.getPricingSource().source === "missing") {
+			t.skip("pi-pricer 不可用，跳过用例");
+			return;
+		}
+		const glm = { id: "glm", priceProvider: "zai", name: "GLM", currency: "CNY", matchModel: () => true };
+		const r = cost.calculateCost(glm, "glm-5.3-flash", usage);
+		assert.equal(r.variantLabel, "GLM 默认", "GLM 应以 zai provider 命中方案");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		source.resetPricingSource();
+	}
+});
 
 test("defaults 态: 价表文件缺失 -> defaults（pi-pricer 静默回退内置默认价）", async (t) => {
 	if (!(await pricerAvailable())) {
@@ -216,7 +270,7 @@ test("defaults 态: 用户 v5 价表 -> pi-pricer（不误判为 defaults）", a
 		source.resetPricingSource();
 		await source.ensurePricingSource(undefined, pricingPath);
 		assert.equal(source.getPricingSource().source, "pi-pricer");
-		const r = cost.calculateCost(adapter, "deepseek-flash", usage);
+		const r = cost.calculateCost(adapter, "deepseek-v4-flash", usage);
 		assert.ok(Math.abs(r.totalCNY - 130) < 1e-9, `期望 130 (42+4+84), 实际 ${r.totalCNY}`);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

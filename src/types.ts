@@ -24,6 +24,9 @@ export type BalanceResult = ProviderBalance | { error: string };
 export interface ProviderAdapter {
 	id: string;
 	name: string;
+	/** 价表里使用的 provider key（pi 真实 provider id，如 deepseek / zai）；
+	 *  缺省回退 id。注意 id 同时用作余额/台账/配置的 key，二者不可混用。 */
+	priceProvider?: string;
 	/** 计价货币, 当前统一为 CNY */
 	currency: "CNY";
 	/** 当前选中的模型是否属于该 provider */

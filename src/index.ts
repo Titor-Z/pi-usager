@@ -15,6 +15,7 @@ export const ADAPTERS: ProviderAdapter[] = [deepseekAdapter, glmAdapter];
 /** 通用兜底适配器: 未识别的模型不计费 (费用显示为 0), 但用量统计照常 */
 export const genericAdapter: ProviderAdapter = {
 	id: "generic",
+	priceProvider: "generic",
 	name: "通用",
 	currency: "CNY",
 	matchModel: () => false,

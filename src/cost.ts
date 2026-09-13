@@ -27,11 +27,13 @@ export function calculateCost(
 	modelId: string | undefined,
 	usage: Usage,
 	now = new Date(),
+	providerId?: string,
 ): CostBreakdown {
 	if (!modelId) {
 		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false, priceKnown: false };
 	}
-	const price = resolvePrice(modelId, adapter.id, now);
+	// 价表 key = 运行时 pi provider > 适配器声明的 priceProvider > id
+	const price = resolvePrice(modelId, providerId ?? adapter.priceProvider ?? adapter.id, now);
 	if (!price) {
 		// 共享价表不可用: 不估算, 交由调用方按 getPricingSource() 提示
 		return { inputMissCost: 0, inputHitCost: 0, outputCost: 0, totalCNY: 0, free: false, priceKnown: false };

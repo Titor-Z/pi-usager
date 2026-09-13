@@ -12,6 +12,7 @@ import { queryBalanceFor } from "./balance.ts";
 
 export const deepseekAdapter: ProviderAdapter = {
 	id: "deepseek",
+	priceProvider: "deepseek", // pi 真实 provider id
 	name: "DeepSeek",
 	currency: "CNY",
 	matchModel: (modelId) => !!modelId && modelId.toLowerCase().includes("deepseek"),

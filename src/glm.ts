@@ -15,6 +15,7 @@ import { queryBalanceFor } from "./balance.ts";
 
 export const glmAdapter: ProviderAdapter = {
 	id: "glm",
+	priceProvider: "zai", // 价表用 pi 真实 provider id（pi 的 GLM provider 是 zai）
 	name: "GLM",
 	currency: "CNY",
 	matchModel: (modelId) => !!modelId && modelId.toLowerCase().includes("glm"),
