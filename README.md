@@ -47,14 +47,17 @@ pi extension add @foolsecret/pi-usager
 > 且把它声明为**可选 peer 依赖**（不会自动安装）。未安装时用量统计照常，但**费用无法估算**
 > （状态栏显示 `价格未知`，并在首次对话时提示安装）。这是设计选择 —— 价表由专职模块统一维护，
 > 插件不再各自硬编码，避免多扩展口径不一致。
+>
+> **版本要求**：本版对接 pi-pricer **Schema v5（≥ 0.14.0）**。旧版价表（version≠5）会被 pi-pricer 静默忽略，
+> pi-usager 会据此提示「内置默认价」而非假装你的配置已生效。
 
 ## 四、状态栏读法
 
 双行布局（默认，对齐 Pi 原生结构）：
 
 ```
-~/projects/pi-usager (main) +3-5 • my-session   PROMPT auto·normal·deep   💰¥2.12 🦦
-↑130.9k ↓24.5k R1.34M CH91.1% ¥0.0078/¥0.24·工作日高峰  5.9%/1.00M   glm-5.3-flash • high
+~/projects/pi-usager@main +3-5 • my-session   auto∙normal∙deep   💰¥2.12 🦦
+↑130.9k ↓24.5k R1.34M CH89.4%·95.1% ¥0.0078/¥0.24·工作日高峰  5.9%/1.00M   glm-5.3-flash • high
 ```
 
 ### 字段口径
@@ -66,9 +69,9 @@ pi extension add @foolsecret/pi-usager
 | `• my-session` | 会话名 | 空间不足时最先省略 |
 | `PROMPT auto·normal·deep` | pi-prompt 的三轴状态（软检测） | 装 pi-prompt 时出现，位于余额左侧 |
 | `↑ / ↓ / R` | 累计输入 / 输出 / 缓存命中 token | 单位 k / M，来源 Pi 上报的 usage |
-| `CH91.1%` | 缓存命中率 | `<90%` 常态 → `90~95%` 主题蓝 → `≥95%` 紫 |
+| `CH89.4%·95.1%` | 缓存命中率（**本次**·**会话平均**） | 分档按平均值：`<90%` 常态 → `90~95%` 主题蓝 → `≥95%` 紫 |
 | `¥0.0078/¥0.24` | 此次回答 / 会话累计预估费用 | 免费模型显示 `FREE`；无价表显示 `价格未知` |
-| `·工作日高峰` | 当前命中的**计价方案名** | 来自 pi-pricer 解析链，非硬编码 |
+| `·工作日高峰` | 当前命中的**计价方案**（**别名优先**） | 来自 pi-pricer；无别名用方案全名，超 12 显示列裁剪 |
 | `5.9%/1.00M` | 上下文使用率 / 模型窗口 | — |
 | `glm-5.3-flash • high` | 模型名 + 思考深度 | 多 provider 时带 `(provider)` 前缀 |
 | `💰¥2.12` | 账户余额 | 分档着色，见下 |
@@ -81,7 +84,7 @@ pi extension add @foolsecret/pi-usager
 | 状态 | 含义 | 提示行为 |
 |---|---|---|
 | `pi-pricer 共享价表` | 已读取你自己的 `~/.pi/model-pricing.json` | 无提示 |
-| `pi-pricer 内置默认价` | 装了 pi-pricer，但价表文件缺失/为空 → **静默回退内置默认价** | 首次对话提示核对 |
+| `pi-pricer 内置默认价` | 装了 pi-pricer，但价表文件缺失/为空/损坏，或**旧版价表（version≠5）** → **静默回退内置默认价** | 首次对话提示核对 |
 | `未安装 pi-pricer` | 未装 → 费用无法估算 | 首次对话提示安装 |
 | `不可用` | 已装但解析失败（附原因） | 首次对话提示检查 JSON |
 
@@ -125,7 +128,7 @@ pi extension add @foolsecret/pi-usager
 | `/usage session` | 用量与费用明细（含最近一次回答） |
 | `/usage balance` | 立即校准余额 |
 | `/usage status` | 开关状态栏余额显示 |
-| `/usage peak` | **当前生效价格的完整解析链**（命中/未命中逐条 + 原因） |
+| `/usage peak` | **当前方案结构**：方案名/别名 · 规则（三价 + 星期/时段，`●` 生效中）· 命中链 |
 | `/usage config` | 配置菜单：厂商凭证 / 校准间隔 / HUD 开关 / 布局 / 余额颜色 / 清除凭证 / 查看配置 |
 
 配置存储于 `~/.pi/pi-usager.json`（含凭证与余额缓存，**勿分享/提交**）。

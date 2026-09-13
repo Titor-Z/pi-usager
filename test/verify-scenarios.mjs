@@ -120,7 +120,23 @@ function report(name, ok, detail) {
 const { createRequire } = await import("node:module");
 const require = createRequire(import.meta.url);
 
-console.log("=== pi-usager v2.1.0 三场景验证 ===\n");
+/** v5 价表夹具: 单价格 + 单规则 + 单方案 + 单模型 (对齐 Schema v5 五集合) */
+function v5Fixture({ inputMiss, inputHit, output, alias }) {
+	return {
+		version: 5,
+		rates: [{ _id: "0000000000000001", createdAt: "2026-01-01T00:00:00.000Z", name: "我的价", inputMiss, inputHit, output }],
+		calendars: [],
+		rules: [{
+			_id: "0000000000000011", createdAt: "2026-01-01T00:00:01.000Z", name: "我的规则",
+			rateId: "0000000000000001", timezone: "Asia/Shanghai",
+			weekdays: [], ranges: [], includeCalendars: [], excludeCalendars: [], includeDates: [], excludeDates: [],
+		}],
+		plans: [{ _id: "0000000000000021", createdAt: "2026-01-01T00:00:02.000Z", name: "我的方案", ...(alias ? { alias } : {}), enabled: true, ruleIds: ["0000000000000011"] }],
+		models: [{ _id: "0000000000000031", createdAt: "2026-01-01T00:00:03.000Z", provider: "deepseek", model: "deepseek-flash", planId: "0000000000000021" }],
+	};
+}
+
+console.log("=== pi-usager v2.3.0 四场景验证 ===\n");
 
 // A. 未装 pi-pricer
 {
@@ -151,22 +167,35 @@ console.log("=== pi-usager v2.1.0 三场景验证 ===\n");
 	} finally { rmSync(home, { recursive: true, force: true }); }
 }
 
-// C. 装了且有自定义价表
+// C. 装了且有自定义 v5 价表
 {
-	const home = tempHome({
-		version: 2, calendars: {},
-		prices: { mine: { name: "我的价", input: { miss: 42, hit: 4 }, output: 84 } },
-		plans: { mine: { name: "我的方案", rules: [{ schedule: { timezone: "Asia/Shanghai", weekdays: [], ranges: [] }, price: "mine" }] } },
-		providers: { deepseek: { models: { "deepseek-flash": { plans: [{ plan: "mine", enabled: true }] } } } },
-	});
+	const home = tempHome(v5Fixture({ inputMiss: 42, inputHit: 4, output: 84, alias: "自配短名" }));
 	try {
 		const r = runScenario("C", home);
 		const anyHint = r.notifications.filter((n) => /pi-pricer|内置默认价/.test(n.msg));
-		report("场景 C · 有自定义价表 → 无提示且费用按自定义价",
+		report("场景 C · 有自定义 v5 价表 → 无提示且费用按自定义价",
 			anyHint.length === 0 && Math.abs(r.total - 130) < 1e-6, [
 			`来源态: ${r.source} (期望 pi-pricer)`,
 			`多余提示: ${anyHint.length === 0 ? "无 (正确)" : anyHint.map((n) => n.msg.slice(0, 40)).join(" | ")}`,
 			`1M miss+hit+out 费用: ¥${r.total} (期望 130)`,
+		]);
+	} finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+// D. 装了但价表是旧版 (version≠5)
+{
+	const home = tempHome({
+		version: 2, calendars: {},
+		prices: { old: { name: "旧价", input: { miss: 1, hit: 0 }, output: 1 } },
+		plans: {}, providers: {},
+	});
+	try {
+		const r = runScenario("D", home);
+		const defaultsHint = r.notifications.find((n) => n.msg.includes("内置默认价"));
+		report("场景 D · 旧版价表 (version≠5) → 提示内置默认价, 不误报共享价表",
+			!!defaultsHint && r.source === "defaults", [
+			`来源态: ${r.source} (期望 defaults)`,
+			`提示: ${defaultsHint ? defaultsHint.msg : "(无)"}`,
 		]);
 	} finally { rmSync(home, { recursive: true, force: true }); }
 }

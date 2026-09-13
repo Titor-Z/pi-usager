@@ -49,7 +49,8 @@ export function calculateCost(
 		free,
 		isPeak: price.isPeak,
 		priceKnown: true,
-		variantLabel: price.planName,
+		// 别名优先 (HUD 短名); 未填别名才用方案全名
+		variantLabel: price.planAlias ?? price.planName,
 	};
 }
 

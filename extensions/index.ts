@@ -27,7 +27,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { resolveProvider, ADAPTERS } from "../src/index.ts";
 import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate, sessionHitRate, turnHitRate } from "../src/cost.ts";
 import {
-	ensurePricingSource, getPricingSource, resolveDebug, getPricingResolver, type ResolutionStep, type PricingSource,
+	ensurePricingSource, getPricingSource, resolveDebug, getPricingResolver, getPlanDetail, type PricingSource,
 } from "../src/pricing-source.ts";
 import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
 import {
@@ -65,12 +65,40 @@ function describePricingSource(source: PricingSource, reason?: string): string {
 		case "pi-pricer":
 			return "pi-pricer 共享价表（~/.pi/model-pricing.json）";
 		case "defaults":
-			return "pi-pricer 内置默认价（未检测到你的自定义配置，请用 /price 核对）";
+			return `pi-pricer 内置默认价（${reason ?? "未检测到 v5 价表"}，请用 /price 核对）`;
 		case "failed":
 			return `不可用（pi-pricer 解析失败：${reason ?? "未知原因"}）`;
 		case "missing":
 			return "未安装 pi-pricer（费用无法估算）";
 	}
+}
+
+/** 方案展示名: 别名优先 (HUD 短名), 无别名用方案全名 */
+function planDisplayName(planName?: string, planAlias?: string): string | undefined {
+	const name = planAlias?.trim() || planName?.trim();
+	return name || undefined;
+}
+
+const WEEKDAY_CN = ["", "一", "二", "三", "四", "五", "六", "日"];
+
+/** 规则生效条件人读描述 (星期 + 时段 + 日历); 均为空 = 全时 */
+function describeRuleWhen(rule: {
+	weekdays: number[];
+	ranges: [string, string][];
+	includeCalendars: string[];
+	excludeCalendars: string[];
+}): string {
+	const parts: string[] = [];
+	if (rule.weekdays.length > 0) {
+		const days = [...rule.weekdays].sort((a, b) => a - b).map((d) => WEEKDAY_CN[d] ?? "?").join("");
+		parts.push(`周${days}`);
+	}
+	if (rule.ranges.length > 0) {
+		parts.push(rule.ranges.map(([s, e]) => `${s}-${e}`).join(","));
+	}
+	if (rule.includeCalendars.length > 0) parts.push(`含日历:${rule.includeCalendars.join("/")}`);
+	if (rule.excludeCalendars.length > 0) parts.push(`排除:${rule.excludeCalendars.join("/")}`);
+	return parts.length > 0 ? parts.join(" · ") : "全时";
 }
 
 /**
@@ -388,7 +416,7 @@ function formatUsageText(
 		lines.push(`  ${kv("最近一次回答", fmtCurrency(turnCost.totalCNY, turnCost.free))}`);
 	}
 
-	if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价") {
+	if (cost.variantLabel) {
 		lines.push(`  ${kv("当前计价", cost.variantLabel)}`);
 	}
 
@@ -431,20 +459,41 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 			`  ${DIM}${PRICER_INSTALL_HINT}${RESET}`,
 		];
 	}
+	const plan = getPlanDetail(adapter.id, modelId);
 	const lines: string[] = [sectionTitle(`计价状态 · ${adapter.name}`), ""];
 	lines.push(`  ${kv("当前模型", modelId, 10)}`);
+	const planName = planDisplayName(plan?.planName, plan?.planAlias)
+		?? planDisplayName(debug.price.planName, debug.price.planAlias);
+	lines.push(`  ${kv("当前方案", planName ?? "（未绑定，走兜底价）")}`);
 	lines.push(`  ${kv("价格来源", "pi-pricer 共享价表")}`);
+	if (plan && !plan.enabled) lines.push(`  ${kv("方案状态", "已禁用 → 走兜底价")}`);
 	lines.push("");
 	lines.push(`  ${subTitle("当前生效价格 (¥/百万 tokens)")}`);
 	lines.push(`    ${kv("命中", `¥${debug.price.inputHit}`, 8)}  ${kv("未命中", `¥${debug.price.inputMiss}`, 8)}  ${kv("输出", `¥${debug.price.output}`, 8)}`);
-	lines.push("");
-	lines.push(`  ${subTitle("解析链 (first match wins)")}`);
-	for (const step of debug.chain) {
-		const mark = step.matched ? "●" : "○";
-		lines.push(`  ${mark} ${step.planName} · 规则 ${step.priceId}`);
-		lines.push(`      ${DIM}${step.reason}${RESET}`);
+
+	if (plan && plan.rules.length > 0) {
+		// 当前生效规则 = 解析链中最后一个 matched 的规则 (后创建覆盖先创建)
+		let effectiveRule = "";
+		for (const step of debug.chain) if (step.matched) effectiveRule = step.ruleName;
+		lines.push("");
+		lines.push(`  ${subTitle("方案规则 (后创建覆盖先创建)")}`);
+		for (const rule of plan.rules) {
+			const mark = rule.ruleName === effectiveRule ? "●" : "○";
+			const price = rule.inputMiss !== undefined
+				? `¥${rule.inputMiss} / ¥${rule.inputHit} / ¥${rule.output}`
+				: "（价格缺失）";
+			lines.push(`  ${mark} ${rule.ruleName}  ${DIM}${price} · ${describeRuleWhen(rule)}${RESET}`);
+		}
+	} else {
+		lines.push("");
+		lines.push(`  ${subTitle("解析链 (first match wins)")}`);
+		for (const step of debug.chain) {
+			const mark = step.matched ? "●" : "○";
+			lines.push(`  ${mark} ${step.ruleName}`);
+			lines.push(`      ${DIM}${step.reason}${RESET}`);
+		}
 	}
-	if (debug.chain.length === 0) {
+	if (debug.chain.length === 0 && !plan) {
 		lines.push(`  ${DIM}(该模型在共享价表中无绑定方案)${RESET}`);
 	}
 	if (!debug.matched) {
@@ -734,8 +783,12 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					const turnText = fmtCurrency(turnCost.totalCNY, turnCost.free);
 					costText = `${turnText}/${costText}`;
 				}
-				// 计价方案标记 (来自 pi-pricer 解析链的 planName); 先暂存, 待宽度预算确定后再决定是否附加
-				const planLabel = cost.variantLabel && !cost.free && cost.priceKnown !== false ? cost.variantLabel : null;
+				// 计价方案名 (别名优先, 由 cost.variantLabel 处理); 超长裁到 12 显示列, 始终附加
+				const PLAN_LABEL_MAX = 12;
+				const rawPlanLabel = cost.variantLabel && !cost.free && cost.priceKnown !== false ? cost.variantLabel : null;
+				const planLabel = rawPlanLabel
+					? (visibleWidth(rawPlanLabel) > PLAN_LABEL_MAX ? truncateToWidth(rawPlanLabel, PLAN_LABEL_MAX) : rawPlanLabel)
+					: null;
 				// ── token 统计: 逐段非零才显示 (对齐 pi 原生 footer 形态) ──
 				const statParts: string[] = [];
 				if (total.input) statParts.push(`↑${fmtTokens(total.input)}`);
@@ -784,13 +837,10 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const right2W = visibleWidth(right2);
 				// 右对齐优先: 空间不足先截左半 (token/费用是诊断信息, 可截), 模型名保住
 				const budget2 = Math.max(0, width - right2W - 2);
-				// 计价方案名: 仅在预算充足时才附加 (方案名可能很长, 如 "deepseek 全时谷价");
-				// 它是最低优先级信息 —— 宁可省略, 也不挤掉统计/费用
+				// 计价方案名: 已裁到 12 列, 始终附加 (不再因预算不足整段省略)
 				const planSuffix = planLabel ? theme.fg("dim", `·${planLabel}`) : "";
 				const left2Base = left2 + ctxText;
-				const left2Full = planSuffix && visibleWidth(left2Base) + visibleWidth(planSuffix) <= budget2
-					? left2 + planSuffix + ctxText
-					: left2Base;
+				const left2Full = planLabel ? left2 + planSuffix + ctxText : left2Base;
 				const left2Shown = visibleWidth(left2Full) > budget2 ? truncateToWidth(left2Full, budget2) : left2Full;
 				const pad2 = " ".repeat(Math.max(2, width - visibleWidth(left2Shown) - right2W));
 				const line2 = left2Shown + pad2 + theme.fg("dim", right2);
@@ -809,11 +859,9 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					}
 					const right3 = parts3.join(" ");
 					const budget3 = Math.max(0, width - visibleWidth(right3) - 2);
-					// 单行同样: 方案名仅在预算充足时附加 (复用双行的预算逻辑)
+					// 单行同样: 方案名已裁到 12 列, 始终附加
 					const left3Base = left2 + ctxText;
-					const left3Full = planSuffix && visibleWidth(left3Base) + visibleWidth(planSuffix) <= budget3
-						? left2 + planSuffix + ctxText
-						: left3Base;
+					const left3Full = planLabel ? left2 + planSuffix + ctxText : left3Base;
 					const left3 = visibleWidth(left3Full) > budget3 ? truncateToWidth(left3Full, budget3) : left3Full;
 					const pad3 = " ".repeat(Math.max(2, width - visibleWidth(left3) - visibleWidth(right3)));
 					const line3 = left3 + pad3 + right3;

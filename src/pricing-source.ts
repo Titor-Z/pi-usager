@@ -7,8 +7,9 @@
  * 四态 (供 /usage config 与启动提示用, 对齐 pi-prompt 的范式):
  * - "pi-pricer": 已加载**用户自己的**价表 (权威)
  * - "defaults":  已加载, 但内容等于 pi-pricer 内置默认价
- *                (文件不存在/损坏时 pi-pricer 静默回退, 且 seedPricing 会写入
- *                 一份默认值 —— 必须显式区分, 否则用户以为用的是自己的价)
+ *                (v5 起: 文件缺失/损坏/version≠5 一律静默回退内置种子, 且
+ *                 seedPricing 会写入一份默认值 —— 必须显式区分, 否则用户
+ *                 以为用的是自己的价; 旧版价表也落此态并附原因)
  * - "missing":   未安装 pi-pricer -> 费用无法估算, 提示用户安装
  * - "failed":    已装但加载失败 -> 附原因, 提示检查 JSON
  *
@@ -29,6 +30,14 @@ export interface ResolvedPrice {
 	isPeak: boolean;
 	/** 当前命中规则的所属方案显示名; 未命中 (兜底价) 时为空 */
 	planName?: string;
+	/** 方案别名 (HUD 短名, 优先于 planName 展示); 未填/未命中时为空 */
+	planAlias?: string;
+	/** 命中方案 _id */
+	planId?: string;
+	/** 命中价格 _id */
+	rateId?: string;
+	/** 命中规则 _id */
+	ruleId?: string;
 }
 
 /** 解析器签名 (等效 pi-pricer 的 PricingResolver) */
@@ -45,30 +54,46 @@ let debugResolver: ((model: string, provider: string, timestamp?: Date) => Resol
 let source: PricingSource = "missing";
 let lastFailure: string | undefined;
 let loading: Promise<PricingResolver | null> | null = null;
-/** 本次加载的价表是否为内置默认价 (由 defaultLoader 判定) */
-let isDefaults = false;
+/** 本次加载的价表为内置默认价时的原因 (undefined = 用户的 v5 价表) */
+let defaultsReason: string | undefined;
+/** pi-pricer /db 的 Database.open (动态加载; 供 /usage 渲染真实方案结构) */
+let openDatabase: ((filePath?: string) => DatabaseLike) | null = null;
+/** 本次加载的价表路径 (测试注入时非默认路径; getPlanDetail 复用它) */
+let loadedFilePath: string = PRICING_FILE;
 
 /**
- * 判断当前生效价表是否就是 pi-pricer 的内置默认价。
+ * 判定当前价表是否为 pi-pricer 的内置默认价, 返回原因 (null = 用户的 v5 价表)。
  *
- * 为什么必须判: pi-pricer 的 readPricing() 在文件缺失/损坏时**静默回退**
- * DEFAULT_PRICING, 且 seedPricing() 首次启动就会把默认值写盘 —— "加载成功"
- * 完全不等于"用户的配置生效"。不区分会让用户以为在用自己配的价。
+ * 为什么必须判: pi-pricer v5 的 readPricing() 对 文件缺失/损坏/version≠5
+ * **一律静默回退** DEFAULT_PRICING, 且 seedPricing() 首次启动就会写一份默认值
+ * —— "加载成功"完全不等于"用户的配置生效"。不区分会让用户以为在用自己配的价。
  *
- * 判定方式 (只用公开 API): 文件读不到 / 解不开 => 必然是回退默认值;
- * 文件能读且含内容 => 视为用户价表 (宁可少提示, 不误报)。
- * 不对内容做深度比对 —— pi-pricer 未导出 DEFAULT_PRICING 常量, 而"文件存在
- * 且非空且能解析"已足够区分"用户动过"与"从未动过"两种真实场景。
+ * 判定方式: 与 pi-pricer 的 isV5 同构 —— 只有 version===5 且五集合齐备才视为
+ * 用户的价表; 其余(含旧版价表)均判为默认价, 并给出可读原因。
  */
-function isBuiltinDefaults(filePath: string = PRICING_FILE): boolean {
+function detectDefaults(filePath: string = PRICING_FILE): string | null {
+	let raw: string;
 	try {
-		const raw = readFileSync(filePath, "utf8").trim();
-		if (raw === "") return true; // 空文件 = 无配置
-		JSON.parse(raw); // 解析失败兜到 catch
-		return false; // 有内容且可解析: 用户价表
+		raw = readFileSync(filePath, "utf8").trim();
 	} catch {
-		return true; // 缺失 / 损坏: pi-pricer 会静默用内置默认价
+		return "价表文件缺失";
 	}
+	if (raw === "") return "价表文件为空";
+	let data: unknown;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		return "价表文件 JSON 损坏";
+	}
+	if (typeof data !== "object" || data === null) return "价表文件结构异常";
+	const obj = data as Record<string, unknown>;
+	if (obj.version !== 5) {
+		return `检测到旧版价表（version=${String(obj.version)}），pi-pricer v5 不读取`;
+	}
+	for (const key of ["rates", "calendars", "rules", "plans", "models"]) {
+		if (!Array.isArray(obj[key])) return "价表文件不是 v5 结构";
+	}
+	return null; // v5 结构: 用户价表
 }
 
 /**
@@ -81,11 +106,11 @@ function isBuiltinDefaults(filePath: string = PRICING_FILE): boolean {
 async function defaultLoader(filePath: string = PRICING_FILE): Promise<PricingResolver | null> {
 	const moduleName = "@foolsecret/pi-pricer/pricing";
 	let create: ((filePath?: string) => PricingResolver) | undefined;
-	let debug: ((model: string, provider: string, timestamp?: Date) => ResolutionDebug) | undefined;
+	let debug: ((model: string, provider: string, timestamp?: Date, filePath?: string) => ResolutionDebug) | undefined;
 	try {
 		const mod = (await import(moduleName)) as {
 			createPricingResolver?: (filePath?: string) => PricingResolver;
-			resolveDebug?: (model: string, provider: string, timestamp?: Date) => ResolutionDebug;
+			resolveDebug?: (model: string, provider: string, timestamp?: Date, filePath?: string) => ResolutionDebug;
 		};
 		create = mod.createPricingResolver;
 		debug = mod.resolveDebug;
@@ -93,8 +118,20 @@ async function defaultLoader(filePath: string = PRICING_FILE): Promise<PricingRe
 		return null; // 未安装: 静默, 由调用方归为 missing
 	}
 	if (typeof create !== "function") return null;
-	debugResolver = typeof debug === "function" ? debug : null;
-	isDefaults = isBuiltinDefaults(filePath);
+	// debug 绑定 filePath: 否则注入自定义价表(测试)时 resolveDebug 会走默认路径
+	debugResolver = typeof debug === "function" ? (model, provider, timestamp) => debug(model, provider, timestamp, filePath) : null;
+	loadedFilePath = filePath;
+	defaultsReason = detectDefaults(filePath) ?? undefined;
+	// /db 的 Database.open: 供 /usage 展开方案真实结构; 加载失败不影响计价
+	const dbModuleName = "@foolsecret/pi-pricer/db";
+	try {
+		const dbMod = (await import(dbModuleName)) as {
+			Database?: { open?: (filePath?: string) => DatabaseLike };
+		};
+		openDatabase = typeof dbMod.Database?.open === "function" ? dbMod.Database.open.bind(dbMod.Database) : null;
+	} catch {
+		openDatabase = null;
+	}
 	return create(filePath); // 已装: 让读取/解析错误上抛, 供 failed 状态暴露原因
 }
 
@@ -116,7 +153,7 @@ export async function ensurePricingSource(
 				const loaded = await effective();
 				if (loaded) {
 					resolver = loaded;
-					source = isDefaults ? "defaults" : "pi-pricer";
+					source = defaultsReason === undefined ? "pi-pricer" : "defaults";
 					lastFailure = undefined;
 				} else {
 					source = "missing";
@@ -142,9 +179,10 @@ export function getPricingResolver(): PricingResolver | null {
 	return resolver;
 }
 
-/** 当前价格来源 (含失败原因), /usage config 与启动提示用 */
+/** 当前价格来源 (含失败/默认价原因), /usage config 与启动提示用 */
 export function getPricingSource(): { source: PricingSource; reason?: string } {
-	return lastFailure === undefined ? { source } : { source, reason: lastFailure };
+	const reason = source === "failed" ? lastFailure : source === "defaults" ? defaultsReason : undefined;
+	return reason === undefined ? { source } : { source, reason };
 }
 
 /** 调价: 拿不到解析器时返回 null (调用方降级为"价格未知") */
@@ -153,10 +191,11 @@ export function resolvePrice(model: string, provider: string, now: Date): Resolv
 	return resolver(model, provider, now);
 }
 
-/** 解析链里的一步 (供 /usage peak 展示) */
+/** 解析链里的一步 (pi-pricer v5: ruleName + rateId + reason; 供 /usage peak 展示) */
 export interface ResolutionStep {
-	planName: string;
-	priceId: string;
+	ruleId: string;
+	ruleName: string;
+	rateId: string;
 	matched: boolean;
 	reason: string;
 }
@@ -175,6 +214,94 @@ export function resolveDebug(model: string, provider: string, now: Date): Resolu
 	return debug(model, provider, now);
 }
 
+// ── 方案结构展开 (供 /usage 渲染真实方案, 走 pi-pricer /db) ──────────────
+
+/** pi-pricer Database 的结构子集 (避免编译期强依赖) */
+interface RawModelDoc {
+	planId?: string;
+}
+interface RawRuleDoc {
+	name: string;
+	timezone: string;
+	weekdays: number[];
+	ranges: [string, string][];
+}
+interface RawRateDoc {
+	name: string;
+	inputMiss: number;
+	inputHit: number;
+	output: number;
+}
+interface RawCalendarDoc {
+	name: string;
+}
+interface RawExplanation {
+	plan: { name: string; alias?: string; enabled: boolean };
+	rules: Array<{
+		rule: RawRuleDoc;
+		rate?: RawRateDoc;
+		includeCalendars: RawCalendarDoc[];
+		excludeCalendars: RawCalendarDoc[];
+	}>;
+}
+interface DatabaseLike {
+	findModel(provider: string, model: string): RawModelDoc | undefined;
+	explainPlan(planId: string): RawExplanation | undefined;
+}
+
+/** 方案里的一条规则 (含价格与生效条件), 供 /usage 展示 */
+export interface PlanRuleDetail {
+	ruleName: string;
+	rateName?: string;
+	inputMiss?: number;
+	inputHit?: number;
+	output?: number;
+	timezone?: string;
+	weekdays: number[];
+	ranges: [string, string][];
+	includeCalendars: string[];
+	excludeCalendars: string[];
+}
+
+/** 当前模型的完整方案结构 */
+export interface PlanDetail {
+	planName: string;
+	planAlias?: string;
+	enabled: boolean;
+	rules: PlanRuleDetail[];
+}
+
+/** 展开当前模型的方案结构 (方案 → 规则 → 价格/日历); 不可用返回 null */
+export function getPlanDetail(provider: string, model: string): PlanDetail | null {
+	if (!openDatabase) return null;
+	try {
+		const db = openDatabase(loadedFilePath);
+		const modelDoc = db.findModel(provider, model);
+		if (!modelDoc?.planId) return null;
+		const explanation = db.explainPlan(modelDoc.planId);
+		if (!explanation) return null;
+		return {
+			planName: explanation.plan.name,
+			planAlias: explanation.plan.alias,
+			enabled: explanation.plan.enabled,
+			rules: explanation.rules.map((entry) => ({
+				ruleName: entry.rule.name,
+				rateName: entry.rate?.name,
+				inputMiss: entry.rate?.inputMiss,
+				inputHit: entry.rate?.inputHit,
+				output: entry.rate?.output,
+				timezone: entry.rule.timezone,
+				weekdays: entry.rule.weekdays ?? [],
+				ranges: entry.rule.ranges ?? [],
+				includeCalendars: entry.includeCalendars.map((c) => c.name),
+				excludeCalendars: entry.excludeCalendars.map((c) => c.name),
+			})),
+		};
+	} catch {
+		return null;
+	}
+}
+
 /** 测试专用: 复位回未加载态 */
 export function resetPricingSource(): void {
 	resolver = null;
@@ -182,5 +309,7 @@ export function resetPricingSource(): void {
 	source = "missing";
 	lastFailure = undefined;
 	loading = null;
-	isDefaults = false;
+	defaultsReason = undefined;
+	openDatabase = null;
+	loadedFilePath = PRICING_FILE;
 }
