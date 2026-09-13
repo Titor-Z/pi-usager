@@ -27,6 +27,8 @@ export interface ResolvedPrice {
 	output: number;
 	/** 命中规则是否含时间窗 (weekdays/ranges) —— 用于峰谷图标 */
 	isPeak: boolean;
+	/** 当前命中规则的所属方案显示名; 未命中 (兜底价) 时为空 */
+	planName?: string;
 }
 
 /** 解析器签名 (等效 pi-pricer 的 PricingResolver) */

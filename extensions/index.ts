@@ -25,7 +25,7 @@ import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { resolveProvider, ADAPTERS } from "../src/index.ts";
-import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate } from "../src/cost.ts";
+import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate, sessionHitRate, turnHitRate } from "../src/cost.ts";
 import {
 	ensurePricingSource, getPricingSource, resolveDebug, getPricingResolver, type ResolutionStep, type PricingSource,
 } from "../src/pricing-source.ts";
@@ -100,6 +100,41 @@ function footerSegPeak(
 function peakStatusSuffix(providerId: string, modelId: string | undefined): string {
 	const icon = peakIcon(providerId, modelId);
 	return icon ? ` ${icon}` : "";
+}
+
+/**
+ * 剥离 ANSI SGR 序列 (`\x1b[...m`) —— pi-prompt 用 `\x1b[2m`/`\x1b[22m`
+ * 加 dim 属性, 与 usager 的 `theme.fg("dim")` 主题色不一致; 先去属性再重新主题着色。
+ */
+function stripSgrCodes(text: string): string {
+	return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * 改写 pi-prompt 状态段并重新着色 (双行去 `PROMPT ` 前缀; 单行保留)。
+ * 仅本插件显示层改写, 不改 pi-prompt 本体。
+ */
+function restylePromptSeg(
+	text: string,
+	theme: { fg(color: string, text: string): string },
+	dropPrefix: boolean,
+): string {
+	let out = normalizePromptSeg(stripSgrCodes(text));
+	if (dropPrefix) out = stripPromptPrefix(out);
+	return theme.fg("dim", out);
+}
+
+/**
+ * 改写 pi-prompt 三轴分隔符: ` · ` → `∙` (U+2219, 紧凑成一个整体)。
+ * 仅本插件显示层改写, 不改 pi-prompt 本体 (原生状态栏仍用中点)。
+ */
+function normalizePromptSeg(text: string): string {
+	return text.replace(/ · /g, "∙");
+}
+
+/** 去掉 pi-prompt 状态文本的 `PROMPT ` 前缀 (ANSI 色码保留); 双行布局用 */
+function stripPromptPrefix(text: string): string {
+	return text.replace(/PROMPT\s+/, "");
 }
 
 // ═══════════════════════════════════════════
@@ -354,7 +389,7 @@ function formatUsageText(
 	}
 
 	if (cost.variantLabel && cost.variantLabel !== "标准价" && cost.variantLabel !== "平时价") {
-		lines.push(`  ${kv("当前计价", `${cost.variantLabel}${cost.variantNote ? ` (${cost.variantNote})` : ""}`)}`);
+		lines.push(`  ${kv("当前计价", cost.variantLabel)}`);
 	}
 
 	lines.push("");
@@ -578,7 +613,7 @@ function balanceSegment(
 
 // ═════════════════════════════════════════
 //  Footer (双行, 对齐 pi 0.85.1 原生布局:
-//  第 1 行 workdir (branch) • session 名 …… 余额段; 第 2 行 token 统计 …… 模型名)
+//  第 1 行 workdir@branch • session 名 …… 余额段; 第 2 行 token 统计 …… 模型名)
 // ═══════════════════════════════════════════
 
 /** 与原生 footer 同款: HOME 下的路径缩写为 ~ 前缀 */
@@ -628,30 +663,52 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const cost = calculateCost(adapter, modelId, total);
 				const balSeg = balanceSegment(theme, adapter.id);
 				const promptSeg = footerData.getExtensionStatuses().get("pi-prompt");
+				// 双行/单行均去 PROMPT 前缀 —— 均改用 usager 主题 dim 色重新着色
+				const promptSegDual = promptSeg && restylePromptSeg(promptSeg, theme, true);
+				const promptSegSingle = promptSeg && restylePromptSeg(promptSeg, theme, true);
 				const peakSeg = footerSegPeak(theme, adapter.id, modelId);
 
-				// ── 第 1 行: workdir (branch) [+3-5] • session 名 …… 余额段 (右对齐) ──
+				// ── 第 1 行: workdir@branch [+N-M] • session 名 …… 余额段 (右对齐) ──
 				// 余额/翻页动画/欠费态放这行右侧, 可见性最高; git 分色段紧随 branch 之后
 				maybeRefreshGitStatus(ctx.cwd);
-				let pwdLeft = formatCwdForFooter(ctx.cwd, process.env.HOME ?? process.env.USERPROFILE);
+				const cwdText = formatCwdForFooter(ctx.cwd, process.env.HOME ?? process.env.USERPROFILE);
 				const branch = footerData.getGitBranch();
-				if (branch) pwdLeft += ` (${branch})`;
-				const pwdBase = pwdLeft; // 降级链回退基线 (仅路径+branch)
+				// 纯文本形态 (降级链/宽度判定/截断均用它; ANSI 不影响 visibleWidth)
+				let pwdLeft = branch ? `${cwdText}@${branch}` : cwdText; // 无分支时不加 @ (纯路径)
+				const pwdBase = pwdLeft; // 降级链回退基线 (仅路径@分支)
 				const gitSeg = branch ? formatGitSegment(theme) : null;
 				if (gitSeg) pwdLeft += ` ${gitSeg}`;
 				const sessionName = ctx.getSessionName?.();
 				if (sessionName) pwdLeft += ` • ${sessionName}`;
+				// 渲染: cwd 与 branch 均 dim, `@` 连接符单独 muted (仅符号, 分支名不变)
+				const stylePwd = (pwd: string): string => {
+					if (!branch) return theme.fg("dim", pwd);
+					const marker = `${cwdText}@${branch}`;
+					if (!pwd.startsWith(marker)) return theme.fg("dim", pwd); // 已降级到无 @ 形态
+					const rest = pwd.slice(marker.length);
+					return theme.fg("dim", cwdText) + theme.fg("muted", "@") + theme.fg("dim", branch) + rest;
+				};
 
 				// 第 1 行右侧降级链: prompt HUD 先丢, 再丢峰谷图标, 余额段最后才可能被截
 				// 顺序: [prompt] [余额] [峰谷] —— prompt 在余额左边 (用户指定), 峰谷图标留最右
-				let r1parts = [promptSeg, balSeg, peakSeg].filter((p): p is string => p !== undefined);
-				if (promptSeg && visibleWidth(r1parts.join(" ")) > width) {
-					r1parts = r1parts.filter((p) => p !== promptSeg);
+				// 拼接: prompt 与余额之间加 ` · ` 分隔 (仅双行); 余额↔峰谷仍用空格
+				const joinRight1 = (parts: (string | undefined)[]): string => {
+					const kept = parts.filter((p): p is string => p !== undefined);
+					if (kept.length === 0) return "";
+					if (promptSegDual && kept[0] === promptSegDual) {
+						// 分隔符套 footer 默认 dim 色, 与周围文字一致 (裸串会用终端默认前景色)
+						return [kept[0], kept.slice(1).join(" ")].join(theme.fg("dim", " · "));
+					}
+					return kept.join(" ");
+				};
+				let r1parts = [promptSegDual, balSeg, peakSeg];
+				if (promptSegDual && visibleWidth(joinRight1(r1parts)) > width) {
+					r1parts = r1parts.filter((p) => p !== promptSegDual);
 				}
-				if (peakSeg && visibleWidth(r1parts.join(" ")) > width) {
+				if (peakSeg && visibleWidth(joinRight1(r1parts)) > width) {
 					r1parts = r1parts.filter((p) => p !== peakSeg);
 				}
-				const right1 = r1parts.join(" ");
+				const right1 = joinRight1(r1parts);
 				const budget1 = Math.max(0, width - visibleWidth(right1) - 2);
 				// 降级链: 先去 session 名 (诊断价值最低), 再去 git 分色段, 仍不足才截路径
 				if (visibleWidth(pwdLeft) > budget1 && sessionName) {
@@ -660,7 +717,7 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				if (visibleWidth(pwdLeft) > budget1 && gitSeg) {
 					pwdLeft = pwdBase;
 				}
-				const left1 = theme.fg("dim", visibleWidth(pwdLeft) > budget1 ? truncateToWidth(pwdLeft, budget1) : pwdLeft);
+				const left1 = stylePwd(visibleWidth(pwdLeft) > budget1 ? truncateToWidth(pwdLeft, budget1) : pwdLeft);
 				const pad1 = " ".repeat(Math.max(2, width - visibleWidth(left1) - visibleWidth(right1)));
 				const line1 = left1 + pad1 + right1;
 
@@ -677,36 +734,36 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					const turnText = fmtCurrency(turnCost.totalCNY, turnCost.free);
 					costText = `${turnText}/${costText}`;
 				}
-				// 计价方案标记 (来自 pi-pricer 解析链的方案名)
-				if (cost.variantLabel && !cost.free && cost.priceKnown !== false) {
-					costText += `·${cost.variantLabel}`;
-				}
-				// CH 缓存命中率分色: <90% dim (常态) / 90~95% accent 主题蓝 (良好) / ≥95% 紫 (优秀, ANSI 绕过主题)
-				const chRate = parseFloat(hitRate(total.input, total.cacheRead));
+				// 计价方案标记 (来自 pi-pricer 解析链的 planName); 先暂存, 待宽度预算确定后再决定是否附加
+				const planLabel = cost.variantLabel && !cost.free && cost.priceKnown !== false ? cost.variantLabel : null;
+				// ── token 统计: 逐段非零才显示 (对齐 pi 原生 footer 形态) ──
+				const statParts: string[] = [];
+				if (total.input) statParts.push(`↑${fmtTokens(total.input)}`);
+				if (total.output) statParts.push(`↓${fmtTokens(total.output)}`);
+				if (total.cacheRead) statParts.push(`R${fmtTokens(total.cacheRead)}`);
+				if (total.cacheWrite) statParts.push(`W${fmtTokens(total.cacheWrite)}`);
+				// CH 双值: 本次命中(对齐原生公式) · 会话平均(provider 自适应分母)
+				// 分档色按**平均**速率 (阈值 90/95 沿用): <90 dim / 90~95 accent / ≥95 紫
+				const nowRate = lastTurn ? turnHitRate(lastTurn) : null;
+				const avgRate = sessionHitRate(total);
 				const CH_GREEN = 90;
 				const CH_PURPLE = 95;
-				const chText = `CH${chRate}%`;
-				const chStyled = chRate >= CH_PURPLE
-					? `${PURPLE_ANSI}${chText}\x1b[0m`
-					: chRate >= CH_GREEN ? theme.fg("accent", chText) : null;
-				if (chStyled) {
-					left2 += theme.fg(
-						"dim",
-						`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} `,
-					) + `${chStyled} ` + theme.fg("dim", costText);
-				} else {
-					left2 += theme.fg(
-						"dim",
-						`↑${fmtTokens(total.input)} ↓${fmtTokens(total.output)} R${fmtTokens(total.cacheRead)} ${chText} ${costText}`,
-					);
+				if ((total.cacheRead > 0 || total.cacheWrite > 0) && nowRate !== null && avgRate !== null) {
+					const chText = `CH${nowRate.toFixed(1)}%·${avgRate.toFixed(1)}%`;
+					const chStyled = avgRate >= CH_PURPLE
+						? `${PURPLE_ANSI}${chText}\x1b[0m`
+						: avgRate >= CH_GREEN ? theme.fg("accent", chText) : theme.fg("dim", chText);
+					statParts.push(chStyled);
 				}
+				left2 += theme.fg("dim", statParts.length ? statParts.join(" ") + " " : "") + theme.fg("dim", costText);
 
-				// 上下文使用率
+				// 上下文使用率 (先用变量持有, 便于在它之前插入方案名)
+				let ctxText = "";
 				try {
 					const cu = ctx.getContextUsage();
 					if (cu && ctx.model?.contextWindow) {
 						const pct = ((cu.tokens / ctx.model.contextWindow) * 100).toFixed(1);
-						left2 += ` ${theme.fg("dim", `${pct}%/${fmtTokens(ctx.model.contextWindow)}`)}`;
+						ctxText = ` ${theme.fg("dim", `${pct}%/${fmtTokens(ctx.model.contextWindow)}`)}`;
 					}
 				} catch { /* ignore */ }
 
@@ -727,7 +784,14 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 				const right2W = visibleWidth(right2);
 				// 右对齐优先: 空间不足先截左半 (token/费用是诊断信息, 可截), 模型名保住
 				const budget2 = Math.max(0, width - right2W - 2);
-				const left2Shown = visibleWidth(left2) > budget2 ? truncateToWidth(left2, budget2) : left2;
+				// 计价方案名: 仅在预算充足时才附加 (方案名可能很长, 如 "deepseek 全时谷价");
+				// 它是最低优先级信息 —— 宁可省略, 也不挤掉统计/费用
+				const planSuffix = planLabel ? theme.fg("dim", `·${planLabel}`) : "";
+				const left2Base = left2 + ctxText;
+				const left2Full = planSuffix && visibleWidth(left2Base) + visibleWidth(planSuffix) <= budget2
+					? left2 + planSuffix + ctxText
+					: left2Base;
+				const left2Shown = visibleWidth(left2Full) > budget2 ? truncateToWidth(left2Full, budget2) : left2Full;
 				const pad2 = " ".repeat(Math.max(2, width - visibleWidth(left2Shown) - right2W));
 				const line2 = left2Shown + pad2 + theme.fg("dim", right2);
 
@@ -745,12 +809,16 @@ function enableFooter(ctx: ExtensionContext, opts?: { silent?: boolean }) {
 					}
 					const right3 = parts3.join(" ");
 					const budget3 = Math.max(0, width - visibleWidth(right3) - 2);
-					const left3 = visibleWidth(left2) > budget3 ? truncateToWidth(left2, budget3) : left2;
+					// 单行同样: 方案名仅在预算充足时附加 (复用双行的预算逻辑)
+					const left3Base = left2 + ctxText;
+					const left3Full = planSuffix && visibleWidth(left3Base) + visibleWidth(planSuffix) <= budget3
+						? left2 + planSuffix + ctxText
+						: left3Base;
+					const left3 = visibleWidth(left3Full) > budget3 ? truncateToWidth(left3Full, budget3) : left3Full;
 					const pad3 = " ".repeat(Math.max(2, width - visibleWidth(left3) - visibleWidth(right3)));
 					const line3 = left3 + pad3 + right3;
-					if (!promptSeg) return [line3];
-					const promptPad = " ".repeat(Math.max(0, width - visibleWidth(promptSeg)));
-					return [line3, promptPad + promptSeg];
+					if (!promptSegSingle) return [line3];
+					return [line3, promptSegSingle]; // 第 2 行左对齐 (已去 PROMPT 前缀)
 				}
 
 				return [line1, line2];

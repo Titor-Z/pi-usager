@@ -49,6 +49,7 @@ export function calculateCost(
 		free,
 		isPeak: price.isPeak,
 		priceKnown: true,
+		variantLabel: price.planName,
 	};
 }
 
@@ -57,27 +58,33 @@ export function calculateCost(
 // ═══════════════════════════════════════════
 
 export interface SessionUsageStats {
-	/** 分支累计 (所有 assistant 消息之和) */
+	/** 分支累计 (assistant + toolResult + compaction/branch_summary; 对齐 pi 原生 footer) */
 	total: Usage;
-	/** 最近一条 assistant 消息的用量 (此次回答) */
+	/** 最近一条 assistant 消息的用量 (此次回答, 用于"本次命中") */
 	lastTurn: Usage | undefined;
 	messageCount: number;
 }
 
-/** 从会话分支中汇总 token 用量 (含最近一次回答) */
+/** 从会话分支中汇总 token 用量 (穷尽所有 usage 来源, 口径对齐 pi 原生 footer) */
 export function getSessionUsage(ctx: any, AssistantMessageCtor?: unknown): SessionUsageStats {
 	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	let lastTurn: Usage | undefined;
 	let messageCount = 0;
+	// 累加一份 usage (口径对齐 pi 原生: 穷尽所有 usage 来源)
+	const addUsage = (u: any): void => {
+		if (!u) return;
+		total.input += u.input ?? 0;
+		total.output += u.output ?? 0;
+		total.cacheRead += u.cacheRead ?? 0;
+		total.cacheWrite += u.cacheWrite ?? 0;
+	};
 	try {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				const m = entry.message as any;
 				if (m.usage) {
-					total.input += m.usage.input ?? 0;
-					total.output += m.usage.output ?? 0;
-					total.cacheRead += m.usage.cacheRead ?? 0;
-					total.cacheWrite += m.usage.cacheWrite ?? 0;
+					addUsage(m.usage);
+					// lastTurn 只取最近一条 assistant ("本次命中"语义)
 					lastTurn = {
 						input: m.usage.input ?? 0,
 						output: m.usage.output ?? 0,
@@ -86,6 +93,15 @@ export function getSessionUsage(ctx: any, AssistantMessageCtor?: unknown): Sessi
 					};
 				}
 				messageCount++;
+				continue;
+			}
+			// 对齐 pi 原生 footer: toolResult / compaction / branch_summary 的 usage 也计入累计
+			if (entry.type === "message" && entry.message.role === "toolResult") {
+				addUsage((entry.message as any).usage);
+				continue;
+			}
+			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				addUsage((entry as any).usage);
 			}
 		}
 	} catch { /* ignore */ }
@@ -102,16 +118,45 @@ export function fmtCurrency(cny: number, free = false): string {
 	return `¥${cny.toFixed(2)}`;
 }
 
+/** 去尾随 0 与孤立小数点: "15.00"→"15", "1.20"→"1.2", "1.24"→"1.24" */
+function trimZero(s: string): string {
+	return s.includes(".") ? s.replace(/0+$/, "").replace(/\.$/, "") : s;
+}
+
 export function fmtTokens(n: number): string {
 	if (n < 1000) return String(n);
-	if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-	return `${(n / 1_000_000).toFixed(2)}M`;
+	if (n < 1_000_000) return `${trimZero((n / 1000).toFixed(2))}k`;
+	return `${trimZero((n / 1_000_000).toFixed(2))}M`;
 }
 
 export function hitRate(input: number, cacheRead: number): string {
 	const denom = input + cacheRead;
 	if (denom <= 0) return "0.0";
 	return ((cacheRead / denom) * 100).toFixed(1);
+}
+
+/**
+ * 会话平均缓存命中率。分母 **provider 自适应**:
+ * 仅当该会话真的上报过 cacheWrite (Anthropic 系等) 才计入分母;
+ * DeepSeek/GLM 等隐式缓存厂商的 cacheWrite 恒为 0, 分母自然退化为 input + cacheRead。
+ * 返回 null = 无可算数据 (分母 <= 0)。
+ */
+export function sessionHitRate(total: Usage): number | null {
+	const denom = total.input + total.cacheRead + (total.cacheWrite > 0 ? total.cacheWrite : 0);
+	if (denom <= 0) return null;
+	return (total.cacheRead / denom) * 100;
+}
+
+/**
+ * 单次(本次)缓存命中率 —— 对齐 pi 原生 footer 公式:
+ * `cacheRead / (input + cacheRead + cacheWrite)`, 总是含 cacheWrite。
+ * pi 的 usage.input 已是 miss 口径, 故这等价于 `cacheRead / promptTokens`。
+ * 返回 null = 无缓存活动。
+ */
+export function turnHitRate(u: Usage): number | null {
+	const promptTokens = u.input + u.cacheRead + u.cacheWrite;
+	if (promptTokens <= 0 || (u.cacheRead + u.cacheWrite) === 0) return null;
+	return (u.cacheRead / promptTokens) * 100;
 }
 
 /** 价表可用性 (footer 展示"价格未知"与峰谷图标判定用) */
