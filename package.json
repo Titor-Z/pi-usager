@@ -1,6 +1,6 @@
 {
 	"name": "@foolsecret/pi-usager",
-	"version": "2.4.0",
+	"version": "2.6.0",
 	"description": "Pi Agent 的用量与计费状态栏 — 实时费用、token、缓存命中率与 GLM/DeepSeek 余额 | Usage & billing HUD for Pi Agent — real-time cost, tokens, cache & GLM/DeepSeek balance",
 	"keywords": [
 		"pi-package",
@@ -16,6 +16,7 @@
 	"files": [
 		"extensions",
 		"src",
+		"skills",
 		"README.md",
 		"LICENSE"
 	],
@@ -29,6 +30,9 @@
 	"pi": {
 		"extensions": [
 			"./extensions/index.ts"
+		],
+		"skills": [
+			"./skills"
 		]
 	},
 	"dependencies": {},

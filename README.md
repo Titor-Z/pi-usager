@@ -58,9 +58,10 @@ pi-usager 会提示「内置默认价」而非假装你的配置已生效。
 | `/usage balance` | 立即校准余额 |
 | `/usage status` | 开关状态栏余额显示 |
 | `/usage peak` | 当前方案结构：方案 / 规则 / 命中链 |
-| `/usage config` | 配置：厂商凭证 / 校准间隔 / HUD 开关 / 布局 / 余额颜色 / 查看配置 |
+| `/usage config` | 配置：校准间隔 / HUD 开关 / 布局 / 余额颜色 / 厂商管理 / 查看配置 |
 
-配置存于 `~/.pi/pi-usager.json`（含凭证与余额缓存，**勿分享或提交**）。
+配置存于 `~/.pi/pi-usager.json`（余额缓存等，**勿分享或提交**）；厂商凭证不在此维护，
+统一取自 pi 的凭证层（见下节）。
 修改价格请用 pi-pricer 的 `/price`，pi-usager 不提供计价配置入口。
 
 ## 余额机制
@@ -78,6 +79,39 @@ pi-usager 会提示「内置默认价」而非假装你的配置已生效。
 
 费用为**本地估算**，非平台账单；GLM 余额接口为控制台端点，可能随平台更新失效。
 
+## 凭证来源
+
+余额查询需要厂商 API Key。pi-usager **不自行保存凭证**，统一从 pi 的凭证层读取
+（`ctx.modelRegistry.getApiKeyForProvider`，覆盖 `~/.pi/agent/auth.json`、`models.json`
+的 `$ENV` 插值 / `!command`，以及 OAuth 令牌自动刷新）。在 pi 里配置一次即可：
+
+```bash
+/login   # 或在 pi 内选择 provider 登录 / 填入 API Key
+```
+
+DeepSeek 与 GLM（pi 的 provider id 为 `zai`）的密钥均由此提供，pi-usager 不再二次录入。
+
+## 添加厂商
+
+厂商支持是**数据驱动**的，新增厂商**不需要写代码**：
+
+- **AI 辅助（荐）**：`/usage ai` 激活 `balance_*` 工具后，说「帮我加 XX 厂商余额」即可；
+  agent 会探测接口、写入 `customProviders` 并试查验证 —— 你只需提供端点或一段控制台 cURL。
+  详细配方在惰性加载的 skill `balance-config`（**不占默认上下文**，可用 `/skill:balance-config` 显式加载）。
+- **内置预设**：GLM、DeepSeek 开箱即用。启用/停用、试查余额在 `/usage config → 厂商管理`。
+- **自定义厂商**：同处选「➕ 添加自定义厂商」，填 名称 / 模型匹配串 / 余额接口 URL /
+  认证方式 / 余额字段路径 即可。支持五种认证：
+  - `bearer` —— 用 pi 中该 provider 的 API Key
+  - `header` —— 自定义请求头，值中 `{{key}}` 会替换为 pi 的 Key
+  - `none` —— 无需认证
+  - `jwt-hs256` —— 智谱同款 HMAC 签名（Key 需为 `id.secret` 格式）
+  - `command` —— 高级兜底：执行一条命令读 stdout JSON，覆盖声明式表达不了的认证/响应
+- **价格**：仍由 pi-pricer 的 `/price` 配置，与厂商无关。
+- **凭证**：自定义厂商用 `bearer`/`header` 时，填的 `pi provider id` 指向 pi 已配置的
+  provider，密钥由 pi 凭证层提供，不落盘。
+
+自定义厂商写入 `~/.pi/pi-usager.json` 的 `customProviders`，也可直接手改该字段。
+
 ## 调试
 
 ```bash
@@ -90,7 +124,10 @@ PI_USAGER_DEBUG=1 pi    # stderr 输出校准 / 扣减 / 翻页 / 欠费 / 价�
 | --- | --- | --- | --- | --- |
 | GLM | ✅ | 由 pi-pricer 定价 | ✅ | ✅ `429` + 余额二次确认 |
 | DeepSeek | ✅ | 由 pi-pricer 定价 | ✅ | ✅ `402` |
-| 其他 | ✅ | 需在 pi-pricer 配置 | — | — |
+| 其他（含 MiMo） | ✅ | 需在 pi-pricer 配置 | 可自行接入 * | — |
+
+\* 无公开余额 API 的厂商（如 MiMo）可用 `/usage config → 厂商管理` 或 `/usage ai` + skill 接入，
+见上文「添加厂商」。
 
 ## 兼容性
 

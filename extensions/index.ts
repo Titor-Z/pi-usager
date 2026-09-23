@@ -2,8 +2,8 @@
  * Model Usage Extension (通用模型用量/计费)
  *
  * 在 pi 中查询模型服务商账户余额和 API 用量统计。
- * 支持 DeepSeek、GLM (智谱), 未来可扩展 Mimo 等 —— 定价与计费逻辑
- * 全部抽离到 ../src/ 公共模块, 按 current model 自动切换。
+ * 厂商支持为数据驱动 (src/presets.ts 内置预设 + 用户 customProviders),
+ * 新增厂商无需写代码 (见 /usage config → 厂商管理); 按 current model 自动切换。
  *
  * 统一人民币 ¥ 计价; 免费模型显示 FREE; 支持限时折扣/峰谷价自动切换。
  * 余额采用双层台账 (src/ledger.ts): 服务端校准 (启动/定时/手动) + 本地估算扣减,
@@ -15,30 +15,32 @@
  *   /usage session    - 仅查当前会话用量（含详细计费 + 最近一次回答费用）
  *   /usage status     - 切换状态栏余额显示
  *   /usage peak       - 当前生效的计价变体（峰谷/限时折扣）及切换时间
- *   /usage config     - 交互式配置（凭证/刷新间隔）
+ *   /usage config     - 交互式配置（HUD / 校准间隔等）
  *
  * 安装: 在 ~/.pi/agent/settings.json 的 packages 中添加 pi-usager 项目路径
- * 配置: ~/.pi/pi-usager.json (凭证/刷新间隔, 由 /usage config 写入)
+ * 配置: ~/.pi/pi-usager.json (余额台账/HUD 偏好, 由 /usage config 写入)
+ * 凭证: 由 pi 凭证层提供 (ctx.modelRegistry), 本插件不存储
  */
 
 import type { ExtensionAPI, ExtensionContext, AssistantMessage } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { resolveProvider, ADAPTERS } from "../src/index.ts";
+import { resolveProvider, getAdapters, getDescriptors } from "../src/index.ts";
 import { calculateCost, getSessionUsage, fmtCurrency, fmtTokens, hitRate, sessionHitRate, turnHitRate } from "../src/cost.ts";
 import {
 	ensurePricingSource, getPricingSource, resolveDebug, getPricingResolver, getPlanDetail, type PricingSource,
 } from "../src/pricing-source.ts";
-import { BALANCE_PROVIDERS, getBalanceProvider, queryBalanceFor } from "../src/balance.ts";
+import { setApiKeyResolver } from "../src/auth.ts";
+import { ProviderAgentTools, BALANCE_AI_TOOL_NAMES } from "../src/provider-agent.ts";
 import {
 	getDisplayedBalance, addSpend, calibrate, isDepleted, markDepleted, clearDepleted, needsCalibrate,
 } from "../src/ledger.ts";
 import {
-	loadConfig, saveProviderConfig, clearProviderConfig,
 	getRefreshMinutes, setRefreshMinutes, getFooterLayout, setFooterLayout,
 	getBalanceColorThresholds, setBalanceColorThresholds,
-	type BalanceProviderConfig,
+	getCustomProviders, setCustomProviders,
 } from "../src/config.ts";
+import type { AuthStrategy, ProviderDescriptor } from "../src/provider-engine.ts";
 import type { ProviderAdapter, ProviderBalance, BalanceResult } from "../src/types.ts";
 import { sectionTitle, subTitle, kv, noteWrap, DIM, RESET, PURPLE as PURPLE_ANSI } from "../src/format.ts";
 
@@ -191,39 +193,121 @@ function formatBalanceText(adapter: ProviderAdapter, balance: ProviderBalance): 
 	return lines;
 }
 
-/** 敏感字段打码 */
-function maskValue(field: { secret?: boolean }, value: string): string {
-	if (!field.secret || !value) return value;
-	if (value.length <= 8) return "****";
-	return `${value.slice(0, 4)}****${value.slice(-4)}`;
-}
-
-/**
-	* 依已录入字段自动推荐选项 (分厂商可扩展)。
-	* GLM: bearer 实测可用 (Bearer 原始 key 调 /api/biz/account/query-customer-account-report),
-	*      jwt 为官方 SDK 同款备用方案。
-	*/
-function autoRecommend(field: { key: string; options?: string[] }, creds: BalanceProviderConfig): string | undefined {
-	if (field.key === "authMode" && field.options) {
-		return field.options[0]; // 声明序第一个为该厂商实测推荐项
-	}
-	return undefined;
-}
-
-function autoRecommendReason(
-	field: { key: string },
-	creds: BalanceProviderConfig,
-	recommended: string,
-): string {
-	if (field.key === "authMode" && recommended === "bearer") {
-		return "（实测 Bearer 直调控制台余额接口可用；jwt 为备用）";
-	}
-	return "";
-}
-
 // ═══════════════════════════════════════════
 //  交互式配置 (/usage config)
 // ═══════════════════════════════════════════
+
+/**
+ * 厂商管理: 列出内置预设与自定义厂商, 支持试查与自定义增删。
+ * 数据驱动 —— 新增/删除只改 ~/.pi/pi-usager.json 的 customProviders, 不涉及代码。
+ */
+async function providerManagerFlow(ctx: ExtensionContext): Promise<void> {
+	const descriptors = getDescriptors();
+	const labelOf = (d: ProviderDescriptor) => `${d.builtin ? "内置" : "自定义"} · ${d.name} (${d.id})`;
+	const ADD = "➕ 添加自定义厂商";
+	const choice = await ctx.ui.select("厂商管理", [...descriptors.map(labelOf), ADD]);
+	if (!choice) return;
+	if (choice === ADD) {
+		await addCustomProviderFlow(ctx);
+		return;
+	}
+	const desc = descriptors.find((d) => labelOf(d) === choice);
+	if (!desc) return;
+
+	const sub = await ctx.ui.select(desc.name, ["试查余额", ...(desc.builtin ? [] : ["删除该厂商"])]);
+	if (sub === "试查余额") {
+		const adapter = adapterById(desc.id);
+		if (!adapter?.queryBalance) {
+			ctx.ui.notify(`${desc.name} 未配置余额查询`, "warning");
+			return;
+		}
+		const result = await adapter.queryBalance();
+		if ("error" in result) ctx.ui.notify(`⚠️ ${result.error}`, "warning");
+		else ctx.ui.notify(`✅ ${desc.name} 余额 ¥${parseFloat(result.total).toFixed(2)}`, "info");
+		return;
+	}
+	if (sub === "删除该厂商") {
+		if (await ctx.ui.confirm("确认删除?", `将移除自定义厂商「${desc.name}」`)) {
+			setCustomProviders(getCustomProviders().filter((d) => d.id !== desc.id));
+			ctx.ui.notify(`已删除 ${desc.name}`, "info");
+			requestFooterRender();
+		}
+	}
+}
+
+/** 交互式新增一个自定义厂商 (写入 customProviders, 不含凭证) */
+async function addCustomProviderFlow(ctx: ExtensionContext): Promise<void> {
+	const name = (await ctx.ui.input("厂商显示名（如 Mimo）", ""))?.trim();
+	if (!name) {
+		ctx.ui.notify("已取消（名称不能为空）", "warning");
+		return;
+	}
+	const defaultId = name.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+	const id = (await ctx.ui.input("内部 id（小写英文，台账/配置的 key）", defaultId))?.trim();
+	if (!id) {
+		ctx.ui.notify("已取消（id 不能为空）", "warning");
+		return;
+	}
+	const patternsRaw = await ctx.ui.input("模型匹配串（逗号分隔，如 mimo, xiaomi）", id);
+	const matchPatterns = (patternsRaw ?? "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+	if (matchPatterns.length === 0) {
+		ctx.ui.notify("已取消（至少需要一个匹配串）", "warning");
+		return;
+	}
+	const piProviderId = (await ctx.ui.input("pi provider id（取密钥用，回车= 内部 id）", id))?.trim() || id;
+
+	const authChoice = await ctx.ui.select("余额接口认证方式", [
+		"bearer ⭐推荐（用 pi 中该 provider 的 API Key）",
+		"header（自定义请求头，值中 {{key}} 替换为 pi 的 Key）",
+		"none（无需认证）",
+		"jwt-hs256（智谱同款 HMAC 签名，key 需为 id.secret）",
+		"command（高级兜底：执行命令读 stdout JSON）",
+	]);
+	if (!authChoice) return;
+	let auth: AuthStrategy;
+	if (authChoice.startsWith("bearer")) {
+		auth = { type: "bearer" };
+	} else if (authChoice.startsWith("header")) {
+		const headerName = (await ctx.ui.input("请求头名称", "Authorization"))?.trim();
+		const headerValue = await ctx.ui.input("请求头值（{{key}} = pi 的 API Key）", "Bearer {{key}}");
+		if (!headerName || headerValue === undefined) {
+			ctx.ui.notify("已取消", "warning");
+			return;
+		}
+		auth = { type: "header", name: headerName, value: headerValue };
+	} else if (authChoice.startsWith("none")) {
+		auth = { type: "none" };
+	} else if (authChoice.startsWith("jwt")) {
+		auth = { type: "jwt-hs256" };
+	} else {
+		const command = (await ctx.ui.input("命令（stdout 输出 JSON）", ""))?.trim();
+		if (!command) {
+			ctx.ui.notify("已取消（命令不能为空）", "warning");
+			return;
+		}
+		auth = { type: "command", command };
+	}
+
+	const endpointsRaw = await ctx.ui.input("余额接口 URL（多个逗号分隔；command 方式可留空）", "");
+	const endpoints = (endpointsRaw ?? "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+	const pathRaw = await ctx.ui.input("余额字段路径（如 data.balance；多候选逗号分隔；command 输出数值可留空）", "");
+	const balancePath = (pathRaw ?? "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+	const availablePath = (await ctx.ui.input("可用性字段路径（可空）", ""))?.trim() || undefined;
+	const currency = (await ctx.ui.input("货币", "CNY"))?.trim() || "CNY";
+
+	const desc: ProviderDescriptor = {
+		id,
+		name,
+		piProviderId,
+		priceProvider: piProviderId,
+		matchPatterns,
+		balance: { endpoints, auth, balancePath, availablePath, currency },
+	};
+	if (!(await ctx.ui.confirm("保存厂商?", `${name} → ${endpoints.join(", ") || "(command)"}\n认证: ${auth.type}`))) return;
+	setCustomProviders([...getCustomProviders(), desc]);
+	ctx.ui.notify(`✅ 已添加 ${name}。费用需在 pi-pricer 配置价表后才会估算。`, "info");
+	requestFooterRender();
+}
 
 async function configFlow(ctx: ExtensionContext): Promise<void> {
 	if (!ctx.hasUI) {
@@ -233,63 +317,15 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 	const action = await ctx.ui.select(
 		"使用量配置",
 		[
-			"配置厂商凭证",
 			"余额校准间隔",
 			`HUD 状态栏: ${footerEnabled ? "开" : "关"}`,
 			`HUD 布局: ${getFooterLayout() === "dual" ? "双行" : "单行"}`,
 			`余额颜色: 提醒线 ¥${getBalanceColorThresholds().yellow.toFixed(2)} / 告急线 ¥${getBalanceColorThresholds().red.toFixed(2)}`,
-			"清除厂商凭证",
+			"厂商管理",
 			"查看当前配置",
 		],
 	);
 	if (!action) return;
-
-	// ── 配置厂商凭证 ──
-	if (action === "配置厂商凭证") {
-		const providerId = await ctx.ui.select("选择厂商", Object.keys(BALANCE_PROVIDERS));
-		if (!providerId) return;
-		const bp = getBalanceProvider(providerId)!;
-		const creds: BalanceProviderConfig = {};
-		for (const field of bp.fields) {
-			if (field.help) ctx.ui.notify(`💡 ${field.label}: ${field.help}`, "info");
-			let value: string | undefined;
-			if (field.options) {
-				// select 型字段: 推荐项加 ⭐ 标记; 若可依据已录入字段自动推荐, 则先提示
-				const recommended = field.recommended ?? autoRecommend(field, creds);
-				if (recommended) {
-					ctx.ui.notify(`✨ 推荐: ${recommended}${autoRecommendReason(field, creds, recommended)}`, "info");
-				}
-				const labeled = field.options.map((opt) =>
-					opt === recommended ? `${opt} ⭐推荐` : opt,
-				);
-				const choice = await ctx.ui.select(field.label, labeled);
-				if (choice === undefined) return;
-				value = choice.replace(/ ⭐推荐$/, "");
-			} else {
-				value = await ctx.ui.input(field.label, field.placeholder ?? "");
-			}
-			if (value === undefined) return; // 用户取消
-			if (value.trim() === "" && !field.optional) {
-				ctx.ui.notify(`已跳过 ${bp.name}（必填字段 ${field.label} 为空）`, "warning");
-				return;
-			}
-			if (value.trim() !== "") creds[field.key] = value.trim();
-		}
-		const ok = await ctx.ui.confirm(
-			"保存凭证?",
-			`将明文保存到 ~/.pi/pi-usager.json（本地文件，勿分享/提交 git）`,
-		);
-		if (!ok) return;
-		saveProviderConfig(providerId, creds);
-		ctx.ui.notify(`${bp.name} 凭证已保存，试查余额中...`, "info");
-		const result = await queryBalanceFor(providerId);
-		if ("error" in result) {
-			ctx.ui.notify(`⚠️ 试查失败: ${result.error}`, "warning");
-		} else {
-			ctx.ui.notify(`✅ 试查成功: ${bp.name} 余额 ¥${parseFloat(result.total).toFixed(2)}`, "info");
-		}
-		return;
-	}
 
 	// ── 校准间隔 ──
 	if (action === "余额校准间隔") {
@@ -351,25 +387,14 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		return;
 	}
 
-	// ── 清除凭证 ──
-	if (action === "清除厂商凭证") {
-		const configured = Object.keys(loadConfig().providers ?? {});
-		if (configured.length === 0) {
-			ctx.ui.notify("当前没有已配置的厂商凭证", "info");
-			return;
-		}
-		const providerId = await ctx.ui.select("清除哪个厂商的凭证?", configured);
-		if (!providerId) return;
-		if (await ctx.ui.confirm("确认清除?", `将删除 ${providerId} 的凭证配置`)) {
-			clearProviderConfig(providerId);
-			ctx.ui.notify(`已清除 ${providerId} 的凭证（将回退到环境变量/auth.json）`, "info");
-		}
+	// ── 厂商管理 (数据驱动: 内置预设 + 用户自定义) ──
+	if (action === "厂商管理") {
+		await providerManagerFlow(ctx);
 		return;
 	}
 
 	// ── 查看当前配置 ──
 	if (action === "查看当前配置") {
-		const config = loadConfig();
 		const lines: string[] = [sectionTitle("使用量配置"), ""];
 		lines.push(`  ${kv("余额校准间隔", `${getRefreshMinutes()} 分钟（两次校准间为本地估算扣减）`)}`);
 		lines.push(`  ${kv("HUD 布局", getFooterLayout() === "dual" ? "双行" : "单行")}`);
@@ -381,17 +406,13 @@ async function configFlow(ctx: ExtensionContext): Promise<void> {
 		if (priceSrc.source === "missing" || priceSrc.source === "failed") {
 			lines.push(`  ${DIM}    ${PRICER_INSTALL_HINT}${RESET}`);
 		}
-		const providers = config.providers ?? {};
-		if (Object.keys(providers).length === 0) {
-			lines.push(`  ${DIM}(未配置任何厂商凭证, 将回退环境变量/auth.json)${RESET}`);
-		}
-		for (const [pid, creds] of Object.entries(providers)) {
-			lines.push(`  ${pid}:`);
-			const bp = getBalanceProvider(pid);
-			for (const field of bp?.fields ?? []) {
-				const v = creds[field.key];
-				if (v !== undefined) lines.push(`    ${kv(field.label, maskValue(field, v), 14)}`);
-			}
+		lines.push(`  ${subTitle("厂商凭证（由 pi 管理，本插件不存储）")}`);
+		for (const adapter of getAdapters()) {
+			const status = ctx.modelRegistry.getProviderAuthStatus(adapter.piProviderId ?? adapter.id);
+			const text = status.configured
+				? `pi 已配置${status.source ? `（${status.source}）` : ""}`
+				: "pi 未配置（/login 或 pi auth）";
+			lines.push(`    ${kv(adapter.name, text, 10)}`);
 		}
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
@@ -514,7 +535,7 @@ function formatVariantStatus(adapter: ProviderAdapter, modelId: string | undefin
 // ═══════════════════════════════════════════
 
 function adapterById(providerId: string): ProviderAdapter | undefined {
-	return ADAPTERS.find((a) => a.id === providerId);
+	return getAdapters().find((a) => a.id === providerId);
 }
 
 /**
@@ -961,6 +982,10 @@ export default function (pi: ExtensionAPI) {
 	let statusEnabled = false;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 
+	// AI 配置工具 (默认注册但不激活; /usage ai 激活)
+	const providerAgentTools = new ProviderAgentTools();
+	providerAgentTools.register(pi);
+
 	const handler = async (args: string, ctx: ExtensionContext) => {
 		const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 		const cmd = parts[0] ?? "";
@@ -1041,6 +1066,36 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// ── /usage ai ── 启用/停用 AI 配置模式 (balance_* 工具)
+		if (cmd === "ai") {
+			const action = parts[1] ?? "on";
+			const active = new Set(pi.getActiveTools());
+			if (action === "off") {
+				providerAgentTools.setEnabled(false);
+				pi.setActiveTools([...active].filter((n) => !BALANCE_AI_TOOL_NAMES.includes(n as (typeof BALANCE_AI_TOOL_NAMES)[number])));
+				ctx.ui.notify("已停用 AI 配置模式。", "info");
+				return;
+			}
+			if (action !== "on") {
+				ctx.ui.notify(`未知动作：ai ${action}（可选 on / off）`, "warning");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("当前模式不支持交互确认，无法启用 AI 配置模式。", "warning");
+				return;
+			}
+			const ok = await ctx.ui.confirm("启用 AI 配置模式？", "启用后，本次会话内 agent 可探测厂商余额接口并修改 customProviders。");
+			if (!ok) {
+				ctx.ui.notify("已取消，未启用 AI 配置模式。", "warning");
+				return;
+			}
+			providerAgentTools.setEnabled(true);
+			// 去重: active 可能已含这些工具, 同名入列两份会让 provider 报 "Tool names must be unique"
+			pi.setActiveTools([...new Set([...active, ...BALANCE_AI_TOOL_NAMES])]);
+			ctx.ui.notify("已启用 AI 配置模式：agent 现可调用 balance_get / balance_probe / balance_apply / balance_test。直接说需求即可；详细配方可用 /skill:balance-config。", "info");
+			return;
+		}
+
 		// ── /usage session ──
 		if (cmd === "session") {
 			const stats = getSessionUsage(ctx);
@@ -1064,7 +1119,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, status, peak, config\n配置相关 (HUD 开关/布局/余额颜色等) 已统一收进 /usage config`, "warning");
+		ctx.ui.notify(`未知子命令: /usage ${cmd}\n支持: balance, session, status, peak, config, ai\n配置相关 (HUD 开关/布局/余额颜色等) 已统一收进 /usage config`, "warning");
 	};
 
 	pi.registerCommand("usage", {
@@ -1075,7 +1130,8 @@ export default function (pi: ExtensionAPI) {
 				{ value: "session", description: "本次会话用量统计" },
 				{ value: "status", description: "开关状态栏余额显示" },
 				{ value: "peak", description: "当前计价档位 (峰谷/限时折扣)" },
-				{ value: "config", description: "配置菜单 (凭证/校准/HUD/颜色)" },
+				{ value: "config", description: "配置菜单 (厂商管理/校准/HUD/颜色)" },
+				{ value: "ai", description: "启用 AI 配置模式 (探测/新增厂商)" },
 			];
 			return items.filter((i) => i.value.startsWith(prefix)).map((i) => ({ value: i.value, label: i.value, description: i.description }));
 		},
@@ -1175,6 +1231,8 @@ export default function (pi: ExtensionAPI) {
 
 	// ── 默认启动时自动开启 footer ──
 	pi.on("session_start", async (_event, ctx) => {
+		// 余额查询的凭证统一来自 pi 凭证层 (auth.json / models.json / OAuth 刷新)
+		setApiKeyResolver((piProviderId) => ctx.modelRegistry.getApiKeyForProvider(piProviderId));
 		footerEnabled = true;
 		enableFooter(ctx, { silent: true });
 		// 启动即显示持久化缓存; 异步校准纠偏 (两会话间充了值会闪 ▲)
